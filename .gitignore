@@ -1,0 +1,6 @@
+rope
+build/
+*.o
+*.dSYM/
+.rope_history
+err.txt
