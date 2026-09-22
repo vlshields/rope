@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Interactive checks through a pseudo-terminal: Ctrl-C at the prompt, Ctrl-C
-during evaluation, Ctrl-D, q(), and history persistence."""
+during evaluation (R's and %time's), Ctrl-D, q(), and history persistence."""
 import os, pty, select, signal, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,7 +94,19 @@ with tempfile.TemporaryDirectory() as tmp:
     read_until(fd, b"[1] 4")
     check("still alive after eval interrupt", True)
 
-    # 4. q() exits cleanly and writes history
+    # 4. Ctrl-C during a %time evaluation unwinds to our context, not R's
+    os.write(fd, b"%time Sys.sleep(30)\n")
+    read_until(fd, b"Sys.sleep(30)")
+    time.sleep(0.5)
+    t0 = time.time()
+    os.write(fd, b"\x03")
+    out = read_until(fd, b"> ")
+    check("ctrl-c interrupts %time", time.time() - t0 < 3 and b"elapsed" not in out)
+    os.write(fd, b"%time 3 + 3\n")
+    out = read_until(fd, b"elapsed")
+    check("%time works after interrupt", b"[1] 6" in out)
+
+    # 5. q() exits cleanly and writes history
     read_until(fd, b"> ")
     os.write(fd, b"q()\n")
     status = wait_exit(pid)
@@ -102,7 +114,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("history written on q()", os.path.exists(hist) and "2 + 2" in open(hist).read())
     os.close(fd)
 
-    # 5. history survives a restart, Ctrl-D exits cleanly
+    # 6. history survives a restart, Ctrl-D exits cleanly
     pending = b""
     pid, fd = spawn(hist)
     read_until(fd, b"> ")
