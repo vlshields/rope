@@ -77,5 +77,20 @@ a=$(grep -n '^after eviction$' "$tmp/out8" | cut -d: -f1)
     || { echo "FAIL: stored value not held, or not released on eviction"; fail=1; }
 grep -q '^\[1\] "5" "6"$' "$tmp/out8" || { echo "FAIL: ring size not honoured"; fail=1; }
 
+# Data frames: print() goes to base R when stdout is not a terminal; %page
+# renders Rope's layout and, with no terminal to page on, writes it out.
+printf 'head(mtcars, 2)\n%%page head(mtcars, 2)\n%%page data.frame(x = c(1.5, NA), s = c(NA, "a"))\n%%page 1:3\n%%page\nOut[[-1]]\n%%page stop("nope")\nq()\n' \
+    | ROPE_HISTFILE="$tmp/hist" ./rope >"$tmp/out9" 2>"$tmp/err9"
+grep -q '^Mazda RX4      21   6  160 110  3.9 2.620 16.46  0  1    4    4$' "$tmp/out9" \
+    || { echo "FAIL: piped print of a data frame should be base R's"; fail=1; }
+grep -q '^data.frame \[2 .* 11\]$' "$tmp/out9" || { echo "FAIL: %page frame title missing"; fail=1; }
+grep -q '^ *mpg *cyl .* carb$' "$tmp/out9" || { echo "FAIL: %page should show every column"; fail=1; }
+grep -q '^ *<dbl> *<dbl>' "$tmp/out9" || { echo "FAIL: %page type row missing"; fail=1; }
+grep -q '^1   1.5 <NA>$' "$tmp/out9" || { echo "FAIL: %page NA cells wrong"; fail=1; }
+grep -q '^  <dbl> <chr>$' "$tmp/out9" || { echo "FAIL: %page chr column not left-aligned"; fail=1; }
+[ "$(grep -c '^\[1\] 1 2 3$' "$tmp/out9")" -eq 3 ] || { echo "FAIL: %page of a vector, bare %page or Out wrong"; fail=1; }
+grep -q '^Error: nope$' "$tmp/err9" || { echo "FAIL: %page error not reported"; fail=1; }
+grep -q "$(printf '\033')" "$tmp/out9" && { echo "FAIL: colour written to a pipe"; fail=1; }
+
 if [ "$fail" -eq 0 ]; then echo "smoke: ok"; else for f in "$tmp"/out* "$tmp"/err*; do echo "--- $f ---"; cat "$f"; done; fi
 exit "$fail"
