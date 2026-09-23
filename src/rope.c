@@ -7,6 +7,10 @@
  * non-blank character is '%' is a front-end command, not R code.
  * Milestone 3: output history. Every visible top-level result is kept in a
  * ring, numbered by the prompt it came from, and exposed to R as Out and In.
+ * Milestone 4: the line editor. A vendored isocline replaces readline:
+ * multi-line editing of whole expressions, syntax colour, completion through
+ * R's own utils:::.completeToken, and the prompt shows the number the next
+ * result will be filed under.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -14,8 +18,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
-#include <setjmp.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <readline/history.h>
-#include <readline/readline.h>
+#include <isocline.h>
 
 #include <Rinternals.h>
 #include <Rembedded.h>
@@ -45,9 +46,8 @@ extern char R_ParseErrorMsg[];      /* filled in when R_ParseVector fails    */
 /* ---- state ---------------------------------------------------------------- */
 
 static char rope_histfile[4096];
-static volatile sig_atomic_t rope_in_readline = 0;
-static sigjmp_buf rope_jmp;
 static void (*rope_default_cleanup)(SA_TYPE, int, int) = NULL;
+static SEXP rope_env = NULL;               /* the environment attached as "rope" */
 
 /*
  * Prompt numbering. rope_input_n counts non-blank lines read at a top-level
@@ -70,6 +70,11 @@ static int rope_evaldepth = 0;             /* live entries in rope_evaln       *
 
 /* ---- history -------------------------------------------------------------- */
 
+/*
+ * Line history is isocline's: loaded here, and written back after every line
+ * so nothing is lost if R dies. The file is one entry per line, which is also
+ * what readline wrote, so an old file carries over.
+ */
 static void rope_history_init(void)
 {
     const char *env = getenv("ROPE_HISTFILE");
@@ -80,14 +85,7 @@ static void rope_history_init(void)
         if (!home) home = ".";
         snprintf(rope_histfile, sizeof rope_histfile, "%s/.rope_history", home);
     }
-    using_history();
-    stifle_history(10000);
-    read_history(rope_histfile);
-}
-
-static void rope_history_save(void)
-{
-    if (rope_histfile[0]) write_history(rope_histfile);
+    ic_set_history(rope_histfile, 10000);
 }
 
 /* ---- output history ------------------------------------------------------- */
@@ -307,16 +305,28 @@ static const char rope_r_setup[] =
     "  }\n"
     "  env$Out <- structure(list(), class = 'rope_out')\n"
     "  env$In  <- structure(list(), class = 'rope_in')\n"
+    "  env$.rope_complete <- function(line, end) {\n"
+    "    utils:::.assignLinebuffer(line)\n"
+    "    utils:::.assignEnd(end)\n"
+    "    utils:::.guessTokenFromLine()\n"
+    "    suppressWarnings(utils:::.completeToken())\n"
+    "    list(utils:::.CompletionEnv[['token']], utils:::.retrieveCompletions())\n"
+    "  }\n"
     "  attach(env, name = 'rope', warn.conflicts = FALSE)\n"
     "  addTaskCallback(function(expr, value, ok, visible)\n"
     "    .Call('rope_out_record', expr, value, visible), name = 'rope')\n"
+    "  env\n"
     "})\n";
 
 static void rope_setup_cb(void *data)
 {
-    SEXP exprs = data;
+    SEXP exprs = data, value = R_NilValue;
     for (R_xlen_t i = 0; i < XLENGTH(exprs); i++)
-        Rf_eval(VECTOR_ELT(exprs, i), R_GlobalEnv);
+        value = Rf_eval(VECTOR_ELT(exprs, i), R_GlobalEnv);
+    if (TYPEOF(value) == ENVSXP) {
+        rope_env = value;
+        R_PreserveObject(rope_env);
+    }
 }
 
 static void rope_out_init(void)
@@ -602,29 +612,298 @@ static void rope_line_read(const char *prompt, unsigned char *buf, int len)
     rope_intercept(prompt, buf, len);
 }
 
-/* ---- console hooks -------------------------------------------------------- */
+/* ---- line editor ---------------------------------------------------------- */
 
-static void rope_sigint(int sig)
+/*
+ * Input comes through isocline (vendored under src/isocline). It owns the
+ * terminal while a line is being edited: the tty is in raw mode with ISIG
+ * off, so Ctrl-C arrives as a keypress and cancels the line instead of
+ * raising SIGINT. R's signal handlers stay installed throughout and take
+ * over the moment the line is handed back and evaluation starts.
+ */
+
+static const char *rope_edit_prompt = "";  /* R's prompt for the line being edited */
+
+static const char *rope_continue_prompt(void)
 {
-    (void)sig;
-    if (rope_in_readline) siglongjmp(rope_jmp, 1);
+    SEXP opt = Rf_GetOption1(Rf_install("continue"));
+    if (TYPEOF(opt) != STRSXP || XLENGTH(opt) < 1) return "+ ";
+    return CHAR(STRING_ELT(opt, 0));
 }
 
 /*
- * Read one line for R. Returns 0 on EOF, 1 otherwise. The buffer handed to R
- * must end in '\n'.
- *
- * SIGINT while readline is active is ours: we long-jump out of readline,
- * clean up its terminal state, and reprompt. R's own handler is restored on
- * every exit path so that evaluation-time interrupts still reach R.
+ * What the user sees. R's top-level prompt gets the number of the line about
+ * to be typed in front of it, so that "[7]> " and Out[[7]] match. Browser
+ * prompts, continuation prompts and readline() prompts are shown as R sent
+ * them. isocline reads the prompt as markup, so '[' has to be escaped.
  */
+static void rope_display_prompt(const char *prompt, char *out, size_t n)
+{
+    SEXP opt = Rf_GetOption1(Rf_install("prompt"));
+    int top = !rope_busy && TYPEOF(opt) == STRSXP && XLENGTH(opt) > 0 &&
+              strcmp(prompt, CHAR(STRING_ELT(opt, 0))) == 0;
+    size_t i = 0;
+    if (top && n > 16) i = (size_t)snprintf(out, n, "\\[%d]", rope_input_n + 1);
+    for (const char *p = prompt; *p && i + 2 < n; p++) {
+        if (*p == '[') out[i++] = '\\';
+        out[i++] = *p;
+    }
+    out[i] = '\0';
+}
+
+/*
+ * Enter submits the buffer only when R could parse it completely. Anything
+ * unfinished, an open brace or quote or a trailing operator, gets a newline
+ * instead, so a whole expression is edited as one unit and R never has to
+ * ask for a continuation. Command lines and lines read as data are taken as
+ * typed, and so is a line at R's own continuation prompt: it is a fragment.
+ */
+struct rope_parse_check { const char *text; ParseStatus status; };
+
+static void rope_parse_check_cb(void *data)
+{
+    struct rope_parse_check *pc = data;
+    SEXP src = PROTECT(Rf_mkString(pc->text));
+    R_ParseVector(src, -1, &pc->status, R_NilValue);
+    UNPROTECT(1);
+}
+
+static bool rope_is_complete(const char *input, void *arg)
+{
+    (void)arg;
+    if (rope_busy || rope_is_continue_prompt(rope_edit_prompt)) return true;
+    const char *p = input;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '%') return true;
+    struct rope_parse_check pc = { input, PARSE_OK };
+    if (!R_ToplevelExec(rope_parse_check_cb, &pc)) return true;
+    return pc.status != PARSE_INCOMPLETE;
+}
+
+/*
+ * Completion is R's own. .rope_complete in the rope environment drives
+ * utils:::.completeToken and returns the token being completed and the
+ * candidates; each candidate replaces the token. R counts characters where
+ * isocline counts bytes, so the cursor position is converted.
+ */
+static void rope_completer(ic_completion_env_t *cenv, const char *prefix)
+{
+    (void)prefix;
+    if (!rope_env) return;
+    long cursor = 0;
+    const char *input = ic_completion_input(cenv, &cursor);
+    if (!input) return;
+    int nchars = 0;
+    for (long i = 0; i < cursor && input[i]; i++)
+        if ((input[i] & 0xC0) != 0x80) nchars++;
+
+    SEXP fn = Rf_findVarInFrame(rope_env, Rf_install(".rope_complete"));
+    if (fn == R_UnboundValue || TYPEOF(fn) != CLOSXP) return;
+    SEXP call = PROTECT(Rf_lang3(fn, Rf_mkString(input), Rf_ScalarInteger(nchars)));
+    int err = 0;
+    SEXP res = R_tryEvalSilent(call, R_GlobalEnv, &err);
+    if (!err && res != NULL && TYPEOF(res) == VECSXP && XLENGTH(res) == 2) {
+        PROTECT(res);
+        SEXP token = VECTOR_ELT(res, 0), comps = VECTOR_ELT(res, 1);
+        if (TYPEOF(token) == STRSXP && XLENGTH(token) == 1 && TYPEOF(comps) == STRSXP) {
+            const char *tok = Rf_translateCharUTF8(STRING_ELT(token, 0));
+            size_t tlen = strlen(tok);
+            for (R_xlen_t i = 0; i < XLENGTH(comps); i++) {
+                const char *c = Rf_translateCharUTF8(STRING_ELT(comps, i));
+                if (strncmp(c, tok, tlen) != 0) continue;
+                if (!ic_add_completion_prim(cenv, c, NULL, NULL, (long)tlen, 0)) break;
+            }
+        }
+        UNPROTECT(1);
+    }
+    UNPROTECT(1);
+}
+
+static void rope_no_completer(ic_completion_env_t *cenv, const char *prefix)
+{
+    (void)cenv; (void)prefix;
+}
+
+/*
+ * Syntax colour: a small R lexer that only has to be right about where
+ * strings, comments and numbers start and end. Everything it does not
+ * recognise is left in the default colour.
+ */
+static const char *const rope_keywords[] = {
+    "if", "else", "repeat", "while", "function", "for", "next", "break", "in", NULL
+};
+static const char *const rope_constants[] = {
+    "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN",
+    "NA_integer_", "NA_real_", "NA_character_", "NA_complex_", NULL
+};
+
+static int rope_in_list(const char *s, size_t n, const char *const *list)
+{
+    for (; *list; list++)
+        if (strlen(*list) == n && memcmp(*list, s, n) == 0) return 1;
+    return 0;
+}
+
+static int rope_is_ident(unsigned char c)
+{
+    return isalnum(c) || c == '.' || c == '_' || c >= 0x80;
+}
+
+/* s[i] is r or R and s[i+1] a quote. Index just past the raw string, or -1
+ * if it is not one. An unterminated raw string runs to the end. */
+static long rope_raw_string_end(const char *s, long i, long n)
+{
+    char q = s[i + 1];
+    long j = i + 2;
+    int dashes = 0;
+    while (j < n && s[j] == '-') { dashes++; j++; }
+    if (j >= n) return -1;
+    char close;
+    switch (s[j]) {
+    case '(': close = ')'; break;
+    case '[': close = ']'; break;
+    case '{': close = '}'; break;
+    default: return -1;
+    }
+    for (j++; j < n; j++) {
+        if (s[j] != close) continue;
+        long k = j + 1;
+        int d = 0;
+        while (k < n && s[k] == '-' && d < dashes) { d++; k++; }
+        if (d == dashes && k < n && s[k] == q) return k + 1;
+    }
+    return n;
+}
+
+static void rope_highlight(ic_highlight_env_t *henv, const char *input, void *arg)
+{
+    (void)arg;
+    long n = (long)strlen(input), i = 0;
+
+    /* A front-end command: colour its name, then the rest as R. */
+    while (i < n && (input[i] == ' ' || input[i] == '\t')) i++;
+    if (i < n && input[i] == '%') {
+        long j = i + 1;
+        while (j < n && !isspace((unsigned char)input[j])) j++;
+        ic_highlight(henv, i, j - i, "rope-command");
+        i = j;
+    } else {
+        i = 0;
+    }
+
+    while (i < n) {
+        unsigned char c = (unsigned char)input[i];
+        if (c == '#') {
+            long j = i;
+            while (j < n && input[j] != '\n') j++;
+            ic_highlight(henv, i, j - i, "rope-comment");
+            i = j;
+        } else if ((c == 'r' || c == 'R') && i + 1 < n &&
+                   (input[i + 1] == '"' || input[i + 1] == '\'') &&
+                   (i == 0 || !rope_is_ident((unsigned char)input[i - 1])) &&
+                   rope_raw_string_end(input, i, n) > 0) {
+            long j = rope_raw_string_end(input, i, n);
+            ic_highlight(henv, i, j - i, "rope-string");
+            i = j;
+        } else if (c == '"' || c == '\'' || c == '`') {
+            long j = i + 1;
+            while (j < n && input[j] != (char)c) {
+                if (input[j] == '\\' && c != '`' && j + 1 < n) j++;
+                j++;
+            }
+            if (j < n) j++;
+            if (c != '`') ic_highlight(henv, i, j - i, "rope-string");
+            i = j;
+        } else if (isdigit(c) || (c == '.' && i + 1 < n && isdigit((unsigned char)input[i + 1]))) {
+            long j = i;
+            int hex = input[i] == '0' && i + 1 < n && (input[i + 1] == 'x' || input[i + 1] == 'X');
+            while (j < n) {
+                unsigned char d = (unsigned char)input[j];
+                if (isalnum(d) || d == '.') j++;
+                else if ((d == '+' || d == '-') && !hex && j > i &&
+                         (input[j - 1] == 'e' || input[j - 1] == 'E')) j++;
+                else break;
+            }
+            ic_highlight(henv, i, j - i, "rope-number");
+            i = j;
+        } else if (rope_is_ident(c)) {
+            long j = i;
+            while (j < n && rope_is_ident((unsigned char)input[j])) j++;
+            if (rope_in_list(input + i, (size_t)(j - i), rope_keywords))
+                ic_highlight(henv, i, j - i, "rope-keyword");
+            else if (rope_in_list(input + i, (size_t)(j - i), rope_constants))
+                ic_highlight(henv, i, j - i, "rope-constant");
+            i = j;
+        } else if (c == '%') {
+            long j = i + 1;
+            while (j < n && input[j] != '%' && input[j] != '\n') j++;
+            if (j < n && input[j] == '%') {
+                ic_highlight(henv, i, j - i + 1, "rope-operator");
+                i = j + 1;
+            } else {
+                i++;
+            }
+        } else if (strncmp(input + i, "<<-", 3) == 0 || strncmp(input + i, "->>", 3) == 0) {
+            ic_highlight(henv, i, 3, "rope-operator");
+            i += 3;
+        } else if (strncmp(input + i, "<-", 2) == 0 || strncmp(input + i, "->", 2) == 0 ||
+                   strncmp(input + i, "|>", 2) == 0) {
+            ic_highlight(henv, i, 2, "rope-operator");
+            i += 2;
+        } else {
+            i++;
+        }
+    }
+}
+
+static void rope_no_highlight(ic_highlight_env_t *henv, const char *input, void *arg)
+{
+    (void)henv; (void)input; (void)arg;
+}
+
+static void rope_editor_init(void)
+{
+    ic_set_prompt_marker("", "");          /* prompts arrive whole from R */
+    ic_enable_hint(false);                 /* a hint would run R's completer on every pause */
+    ic_enable_brace_insertion(false);      /* no auto-closing: type what you mean */
+    ic_set_default_completer(rope_completer, NULL);
+    ic_set_default_highlighter(rope_highlight, NULL);
+    ic_set_is_complete(rope_is_complete, NULL);
+    ic_style_def("rope-keyword",  "ansi-magenta");
+    ic_style_def("rope-constant", "ansi-cyan");
+    ic_style_def("rope-string",   "ansi-green");
+    ic_style_def("rope-number",   "ansi-yellow");
+    ic_style_def("rope-comment",  "ansi-darkgray");
+    ic_style_def("rope-operator", "ansi-magenta");
+    ic_style_def("rope-command",  "bold ansi-cyan");
+}
+
+/* ---- console hooks -------------------------------------------------------- */
+
+/*
+ * Read one line for R. Returns 0 on EOF, 1 otherwise. The buffer handed to R
+ * must end in '\n'. A multi-line expression from the editor is handed over
+ * whole: R's REPL consumes its buffer one line at a time and only asks for
+ * more input once the buffer is empty.
+ */
+static int rope_editor_usable(void)
+{
+    const char *term = getenv("TERM");
+    return isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) &&
+           term && *term && strcmp(term, "dumb") != 0;
+}
+
 static int rope_read_console(const char *prompt, unsigned char *buf, int len,
                              int addtohistory)
 {
     char *line = NULL;
 
-    if (!isatty(STDIN_FILENO)) {
-        /* Piped input: no prompt, no editor, just lines. */
+    if (!rope_editor_usable()) {
+        /* Piped input or a dumb terminal: no editor, just lines. */
+        if (isatty(STDIN_FILENO)) {
+            fputs(prompt, stdout);
+            fflush(stdout);
+        }
         if (!fgets((char *)buf, len, stdin)) return 0;
         size_t n = strlen((char *)buf);
         if (n == 0 || buf[n - 1] != '\n') {
@@ -640,35 +919,29 @@ static int rope_read_console(const char *prompt, unsigned char *buf, int len,
         return 1;
     }
 
-    struct sigaction sa_new, sa_old;
-    memset(&sa_new, 0, sizeof sa_new);
-    sa_new.sa_handler = rope_sigint;
-    sigemptyset(&sa_new.sa_mask);
-    sigaction(SIGINT, &sa_new, &sa_old);
+    /*
+     * Show R's prompt, numbered when it is the top-level one. Further rows of
+     * a multi-line expression carry R's continuation prompt.
+     */
+    char shown[512];
+    rope_display_prompt(prompt, shown, sizeof shown);
+    ic_set_prompt_marker("", rope_continue_prompt());
+    rope_edit_prompt = prompt;
 
     for (;;) {
-        if (sigsetjmp(rope_jmp, 1) != 0) {
-            rope_in_readline = 0;
-            rl_free_line_state();
-            rl_cleanup_after_signal();
-            RL_UNSETSTATE(RL_STATE_ISEARCH | RL_STATE_NSEARCH | RL_STATE_VIMOTION |
-                          RL_STATE_NUMERICARG | RL_STATE_MULTIKEY);
-            rl_done = 1;
-            fputs("^C\n", stdout);
-            fflush(stdout);
+        if (rope_busy)      /* readline() and friends: plain text, no R help */
+            line = ic_readline_ex(shown, rope_no_completer, NULL, rope_no_highlight, NULL);
+        else
+            line = ic_readline(shown);
+        if (!line) {                     /* Ctrl-D on an empty line */
+            fputc('\n', stdout);
+            return 0;
+        }
+        if (ic_readline_cancelled()) {   /* Ctrl-C: the editor said ^C, ask again */
+            ic_free(line);
             continue;
         }
-        rope_in_readline = 1;
-        line = readline(prompt);
-        rope_in_readline = 0;
         break;
-    }
-
-    sigaction(SIGINT, &sa_old, NULL);
-
-    if (!line) {
-        fputc('\n', stdout);
-        return 0;
     }
 
     size_t n = strlen(line);
@@ -680,13 +953,13 @@ static int rope_read_console(const char *prompt, unsigned char *buf, int len,
     buf[n] = '\n';
     buf[n + 1] = '\0';
 
-    if (addtohistory && n > 0) {
-        char *last = NULL;
-        HIST_ENTRY *h = history_get(history_length);
-        if (h) last = h->line;
-        if (!last || strcmp(last, line) != 0) add_history(line);
-    }
-    free(line);
+    /*
+     * isocline files every line it returns, except empty and one-character
+     * ones. R says when a line answers readline() inside an evaluation rather
+     * than the REPL: that is data, not history.
+     */
+    if (!addtohistory && n > 1) ic_history_remove_last();
+    ic_free(line);
     rope_line_read(prompt, buf, len);
     return 1;
 }
@@ -719,7 +992,6 @@ static void rope_busy_hook(int which)
 
 static void rope_cleanup(SA_TYPE saveact, int status, int run_last)
 {
-    rope_history_save();
     if (rope_default_cleanup) rope_default_cleanup(saveact, status, run_last);
     else exit(status);
 }
@@ -755,16 +1027,14 @@ int main(int argc, char **argv)
     ptr_R_Busy = rope_busy_hook;
     ptr_R_CleanUp = rope_cleanup;
 
-    rl_readline_name = "rope";
-    rl_catch_signals = 0;
     rope_history_init();
+    rope_editor_init();
 
     setup_Rmainloop();
     rope_out_init();
     run_Rmainloop();
 
     /* Normally unreachable: q() exits through rope_cleanup. */
-    rope_history_save();
     Rf_endEmbeddedR(0);
     free(rargv);
     return 0;

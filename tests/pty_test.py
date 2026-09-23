@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Interactive checks through a pseudo-terminal: Ctrl-C at the prompt, Ctrl-C
-during evaluation (R's and %time's), Ctrl-D, q(), and history persistence."""
-import os, pty, select, signal, sys, tempfile, time
+during evaluation (R's and %time's), Ctrl-D, q(), history persistence, the
+numbered prompt, multi-line editing and completion."""
+import os, pty, re, select, signal, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROPE = os.path.join(ROOT, "rope")
@@ -10,9 +11,13 @@ def spawn(histfile):
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["ROPE_HISTFILE"] = histfile
-        os.environ["TERM"] = "dumb"
+        os.environ["TERM"] = "xterm"
         os.execv(ROPE, [ROPE])
     return pid, fd
+
+# The editor redraws the line with escape sequences; compare plain text only.
+ESC = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Z0-9]|\x1b[=>]|\r")
+PARTIAL_ESC = re.compile(rb"\x1b(\[[0-9;?]*[ -/]*)?$")
 
 pending = b""
 
@@ -21,6 +26,7 @@ def read_until(fd, needle, timeout=10.0):
     global pending
     buf = pending
     pending = b""
+    held = b""
     end = time.time() + timeout
     while True:
         i = buf.find(needle)
@@ -33,12 +39,15 @@ def read_until(fd, needle, timeout=10.0):
         r, _, _ = select.select([fd], [], [], 0.1)
         if r:
             try:
-                chunk = os.read(fd, 4096)
+                chunk = held + os.read(fd, 4096)
             except OSError:
                 break
             if not chunk:
                 break
-            buf += chunk
+            m = PARTIAL_ESC.search(chunk)
+            held = chunk[m.start():] if m else b""
+            if m: chunk = chunk[:m.start()]
+            buf += ESC.sub(b"", chunk)
     raise AssertionError(f"timed out waiting for {needle!r}; got {buf!r}")
 
 def wait_exit(pid, timeout=10.0):
@@ -56,71 +65,112 @@ def check(name, cond):
     print(("ok   " if cond else "FAIL ") + name)
     if not cond: fails.append(name)
 
+ENTER = b"\r"     # the editor runs the tty raw: Enter is CR, LF inserts a newline
+
 with tempfile.TemporaryDirectory() as tmp:
     hist = os.path.join(tmp, "hist")
 
     pid, fd = spawn(hist)
-    read_until(fd, b"> ")
+    read_until(fd, b"[1]> ")
+    check("prompt is numbered from 1", True)
 
     # 1. Ctrl-C at the prompt clears the line, process stays alive
     os.write(fd, b"half a li")
     read_until(fd, b"half a li")
     os.write(fd, b"\x03")
-    out = read_until(fd, b"> ")
-    check("ctrl-c at prompt reprompts", b"^C" in out)
-    os.write(fd, b"1 + 1\n")
+    out = read_until(fd, b"^C")
+    read_until(fd, b"[1]> ")
+    check("ctrl-c at prompt reprompts with same number", True)
+    os.write(fd, b"1 + 1" + ENTER)
     out = read_until(fd, b"[1] 2")
     check("still alive after ctrl-c", True)
 
     # 2. Ctrl-C during Sys.sleep
-    read_until(fd, b"> ")
-    os.write(fd, b"Sys.sleep(30)\n")
-    read_until(fd, b"Sys.sleep(30)")
+    read_until(fd, b"[2]> ")
+    os.write(fd, b"Sys.sleep(30)" + ENTER)
+    read_until(fd, b"Sys.sleep(30)\n")
     time.sleep(0.5)
     t0 = time.time()
     os.write(fd, b"\x03")
-    out = read_until(fd, b"> ")
+    out = read_until(fd, b"[3]> ")
     check("ctrl-c interrupts Sys.sleep", time.time() - t0 < 3)
 
     # 3. Ctrl-C during a busy loop
-    os.write(fd, b"while (TRUE) {}\n")
-    read_until(fd, b"while (TRUE) {}")
+    os.write(fd, b"while (TRUE) {}" + ENTER)
+    read_until(fd, b"while (TRUE) {}\n")
     time.sleep(0.5)
     t0 = time.time()
     os.write(fd, b"\x03")
-    out = read_until(fd, b"> ")
+    out = read_until(fd, b"[4]> ")
     check("ctrl-c interrupts busy loop", time.time() - t0 < 3)
-    os.write(fd, b"2 + 2\n")
+    os.write(fd, b"2 + 2" + ENTER)
     read_until(fd, b"[1] 4")
     check("still alive after eval interrupt", True)
 
     # 4. Ctrl-C during a %time evaluation unwinds to our context, not R's
-    os.write(fd, b"%time Sys.sleep(30)\n")
-    read_until(fd, b"Sys.sleep(30)")
+    read_until(fd, b"[5]> ")
+    os.write(fd, b"%time Sys.sleep(30)" + ENTER)
+    read_until(fd, b"Sys.sleep(30)\n")
     time.sleep(0.5)
     t0 = time.time()
     os.write(fd, b"\x03")
-    out = read_until(fd, b"> ")
+    out = read_until(fd, b"[6]> ")
     check("ctrl-c interrupts %time", time.time() - t0 < 3 and b"elapsed" not in out)
-    os.write(fd, b"%time 3 + 3\n")
+    os.write(fd, b"%time 3 + 3" + ENTER)
     out = read_until(fd, b"elapsed")
     check("%time works after interrupt", b"[1] 6" in out)
 
-    # 5. q() exits cleanly and writes history
-    read_until(fd, b"> ")
-    os.write(fd, b"q()\n")
+    # 5. An unfinished expression continues on a new line instead of being sent
+    read_until(fd, b"[7]> ")
+    os.write(fd, b"f <- function(x) {" + ENTER)
+    out = read_until(fd, b"+ ")
+    os.write(fd, b"x * 10" + ENTER + b"}" + ENTER)
+    out = read_until(fd, b"[8]> ")
+    check("open brace continues the line", b"\n" in out and b"[8]> " in out)
+    os.write(fd, b"f(4); f" + ENTER)
+    out = read_until(fd, b"[9]> ")
+    check("multi-line expression is one input", b"[1] 40" in out and b"x * 10" in out)
+    os.write(fd, b"\"open" + ENTER + b"quote\"" + ENTER)
+    out = read_until(fd, b"[10]> ")
+    check("open quote continues the line", b'"open\\nquote"' in out)
+
+    # 6. Tab completion comes from R
+    os.write(fd, b"mtcars$mp\t")
+    out = read_until(fd, b"mtcars$mpg")
+    os.write(fd, b"[1]" + ENTER)
+    out = read_until(fd, b"[11]> ")
+    check("tab completes mtcars$mp to mpg", b"[1] 21" in out)
+
+    # 7. An answer to readline() is not a prompt: no number, no history
+    os.write(fd, b"nm <- readline('name? ')" + ENTER)
+    read_until(fd, b")\nname? ")
+    os.write(fd, b"%time" + ENTER)
+    read_until(fd, b"[12]> ")
+    os.write(fd, b"nm" + ENTER)
+    out = read_until(fd, b"[13]> ")
+    check("readline() answer reaches R untouched", b'"%time"' in out)
+
+    # 8. q() exits cleanly and writes history
+    os.write(fd, b"q()" + ENTER)
     status = wait_exit(pid)
     check("q() exits 0", os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)
-    check("history written on q()", os.path.exists(hist) and "2 + 2" in open(hist).read())
+    saved = open(hist).read()
+    check("history written on q()", "2 + 2" in saved and "q()" in saved)
+    check("readline() answer not in history", "%time\n" not in saved)
     os.close(fd)
 
-    # 6. history survives a restart, Ctrl-D exits cleanly
+    # 9. history survives a restart, Ctrl-D exits cleanly
     pending = b""
     pid, fd = spawn(hist)
-    read_until(fd, b"> ")
+    read_until(fd, b"[1]> ")
     os.write(fd, b"\x1b[A")            # up arrow
     out = read_until(fd, b"q()")
     check("up arrow recalls previous line", True)
+    os.write(fd, b"\x1b[A")
+    read_until(fd, b"nm")
+    os.write(fd, b"\x1b[A")
+    out = read_until(fd, b"readline('name? ')")
+    check("history skips the readline() answer", True)
     os.write(fd, b"\x15")              # ctrl-u clears the line
     time.sleep(0.2)
     os.write(fd, b"\x04")              # ctrl-d
