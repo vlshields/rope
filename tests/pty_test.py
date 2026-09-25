@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Interactive checks through a pseudo-terminal: Ctrl-C at the prompt, Ctrl-C
 during evaluation (R's and %time's), Ctrl-D, q(), history persistence, the
-numbered prompt, multi-line editing, completion, data frame layout and the
-pager."""
+numbered prompt, multi-line editing, completion, data frame layout, the
+pager and the debugger."""
 import fcntl, os, pty, re, select, shutil, signal, struct, sys, tempfile, termios, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -227,6 +227,41 @@ with tempfile.TemporaryDirectory() as tmp:
         os.write(fd, b"q()" + ENTER)
         wait_exit(pid)
         os.close(fd)
+
+    # 12. The debugger at a real terminal: the stop is listed in colour, %up
+    # selects a frame for the lines that follow, Ctrl-C cancels a line.
+    pending = b""
+    pid, fd = spawn(hist)
+    read_until(fd, b"[1]> ")
+    os.write(fd, b"g <- function(y) { z <- y * 2; browser(); z }" + ENTER)
+    read_until(fd, b"[2]> ")
+    os.write(fd, b"f <- function(x) { a <- x + 1; g(a) }" + ENTER)
+    read_until(fd, b"[3]> ")
+    os.write(fd, b"f(1)" + ENTER)
+    raw = b""
+    end = time.time() + 10
+    while b"Browse[1]> " not in ESC.sub(b"", raw) and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r: raw += os.read(fd, 4096)
+    check("browser stop is listed, the current line in bold",
+          "\x1b[1m→ 1  g <- function(y)".encode() in raw)
+    os.write(fd, b"%up" + ENTER)
+    out = read_until(fd, b"Browse[1]> ")
+    os.write(fd, b"a * 10" + ENTER)
+    out = read_until(fd, b"[1] 20")
+    check("%up then a line evaluates in the outer frame", True)
+    os.write(fd, b"half a li\x03")
+    read_until(fd, b"^C")
+    read_until(fd, b"Browse[1]> ")
+    os.write(fd, b"x" + ENTER)
+    read_until(fd, b"x\n")
+    out = read_until(fd, b"Browse[1]> ")
+    check("ctrl-c at the browser keeps the selected frame", b"[1] 1" in out)
+    os.write(fd, b"c" + ENTER)
+    read_until(fd, b"> ")
+    os.write(fd, b"q()" + ENTER)
+    wait_exit(pid)
+    os.close(fd)
 
 print("pty:", "ok" if not fails else f"{len(fails)} failed")
 sys.exit(1 if fails else 0)

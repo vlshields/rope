@@ -92,5 +92,53 @@ grep -q '^  <dbl> <chr>$' "$tmp/out9" || { echo "FAIL: %page chr column not left
 grep -q '^Error: nope$' "$tmp/err9" || { echo "FAIL: %page error not reported"; fail=1; }
 grep -q "$(printf '\033')" "$tmp/out9" && { echo "FAIL: colour written to a pipe"; fail=1; }
 
+# Inspector: %who lists without forcing promises, %inspect describes.
+printf 'x <- 1:5\ndf <- data.frame(a = c(1, NA, 3), s = c("u", "v", "v"))\n%%who\n%%who ^d\n%%inspect df\n%%inspect x * 2\n%%inspect sd\n%%inspect list(p = 1, q = list(r = "z"))\np <- function(a, b) { browser(); a }\np(1 + 2, stop("forced"))\n%%who\n%%inspect b\nc\n%%inspect\n%%inspect 1 +\nq()\n' \
+    | ROPE_HISTFILE="$tmp/hist" ./rope >"$tmp/out10" 2>"$tmp/err10"
+grep -q '^df  *data.frame \[3 .* 2\]  *[0-9.]* [kB]*B  *a, s$' "$tmp/out10" || { echo "FAIL: %who data frame row"; fail=1; }
+grep -q '^x  *int \[5\]  *[0-9]* B  *1 2 3 4 5$' "$tmp/out10" || { echo "FAIL: %who vector row"; fail=1; }
+[ "$(grep -c '^x  *int' "$tmp/out10")" -eq 1 ] || { echo "FAIL: %who REGEX should filter"; fail=1; }
+grep -q '^  a  *<dbl>  *min 1, median 2, mean 2, max 3, 1 NA$' "$tmp/out10" || { echo "FAIL: %inspect column summary"; fail=1; }
+grep -q '^  s  *<chr>  *2 unique$' "$tmp/out10" || { echo "FAIL: %inspect chr column"; fail=1; }
+grep -q '^  values  *2 4 6 8 10$' "$tmp/out10" || { echo "FAIL: %inspect of an expression"; fail=1; }
+grep -q '^  environment namespace:stats$' "$tmp/out10" || { echo "FAIL: %inspect function environment"; fail=1; }
+grep -q '^    \$r  chr \[1\]  "z"$' "$tmp/out10" || { echo "FAIL: %inspect nested list"; fail=1; }
+grep -q '^b  *promise  *not yet evaluated: stop("forced")$' "$tmp/out10" || { echo "FAIL: %who should show a promise unforced"; fail=1; }
+grep -q '^  expression  stop("forced")$' "$tmp/out10" || { echo "FAIL: %inspect of a promise"; fail=1; }
+grep -q 'forced' "$tmp/err10" && { echo "FAIL: a promise was forced"; fail=1; }
+grep -q 'usage: %inspect EXPR' "$tmp/err10" || { echo "FAIL: bare %inspect should print usage"; fail=1; }
+grep -q 'parse error' "$tmp/err10" || { echo "FAIL: %inspect parse error not reported"; fail=1; }
+
+# Debugger: the source around each stop, the stack, moving between frames and
+# evaluating in the selected one.
+printf 'g <- function(y) {\n  z <- y * 2\n  browser()\n  z + 1\n}\nf <- function(x) {\n  a <- x + 1\n  g(a)\n}\nf(1)\n%%where\n%%up\na * 100\n%%who\n%%up\n%%down\nz\nn\nc\nIn[[6]]\nOut[[6]]\n%%up\nq()\n' \
+    | ROPE_HISTFILE="$tmp/hist" ./rope >"$tmp/out11" 2>"$tmp/err11"
+grep -q '^→ 3    browser()$' "$tmp/out11" || { echo "FAIL: no listing at browser()"; fail=1; }
+grep -q '^  1  f(1)  line 3$' "$tmp/out11" || { echo "FAIL: %where outer frame"; fail=1; }
+grep -q '^→ 2  g(a)  line 3$' "$tmp/out11" || { echo "FAIL: %where innermost frame"; fail=1; }
+grep -q '^→ 3    g(a)$' "$tmp/out11" || { echo "FAIL: %up listing"; fail=1; }
+grep -q '^\[1\] 200$' "$tmp/out11" || { echo "FAIL: evaluation in the selected frame"; fail=1; }
+grep -q '^x  *dbl \[1\]' "$tmp/out11" || { echo "FAIL: %who in the selected frame"; fail=1; }
+grep -q 'already at the outermost frame' "$tmp/err11" || { echo "FAIL: %up past the outermost frame"; fail=1; }
+grep -q '^\[1\] 4$' "$tmp/out11" || { echo "FAIL: %down should return to the innermost frame"; fail=1; }
+grep -q '^→ 4    z + 1$' "$tmp/out11" || { echo "FAIL: no listing after n"; fail=1; }
+grep -q '^a \* 100$' "$tmp/out11" || { echo "FAIL: In should show the line as typed"; fail=1; }
+[ "$(grep -c '^\[1\] 200$' "$tmp/out11")" -eq 2 ] || { echo "FAIL: Out of a line run in the selected frame"; fail=1; }
+grep -q 'not in the debugger' "$tmp/err11" || { echo "FAIL: %up outside the debugger"; fail=1; }
+
+# Post-mortem: %where and %debug after an uncaught error.
+printf '%%debug\nh <- function(q) g2(q)\ng2 <- function(x) {\n  y <- x\n  log(y)\n}\nh("a")\n%%where\n%%debug\ny\n%%up\nq\nc\ntry(stop("caught"))\n%%where\nstop("top")\n%%debug\nk <- function(n) k(n + 1)\nk(1)\n%%debug\nq()\n' \
+    | ROPE_HISTFILE="$tmp/hist" ./rope >"$tmp/out12" 2>"$tmp/err12"
+grep -q 'no error to debug' "$tmp/err12" || { echo "FAIL: %debug before any error"; fail=1; }
+grep -q '^last error: non-numeric argument to mathematical function$' "$tmp/out12" || { echo "FAIL: %where after an error"; fail=1; }
+grep -q '^  2  g2(q)  line 3$' "$tmp/out12" || { echo "FAIL: stack of the last error"; fail=1; }
+grep -q '^post-mortem of log(y): non-numeric' "$tmp/out12" || { echo "FAIL: %debug header"; fail=1; }
+grep -q '^→ 3    log(y)$' "$tmp/out12" || { echo "FAIL: %debug listing"; fail=1; }
+grep -q 'Called from' "$tmp/out12" && { echo "FAIL: %debug's own browser() call shown"; fail=1; }
+[ "$(grep -c '^\[1\] "a"$' "$tmp/out12")" -eq 2 ] || { echo "FAIL: values in post-mortem frames"; fail=1; }
+[ "$(grep -c '^last error: non-numeric' "$tmp/out12")" -eq 2 ] || { echo "FAIL: a caught error replaced the last one"; fail=1; }
+grep -q 'last error happened at top level' "$tmp/err12" || { echo "FAIL: %debug of a top-level error"; fail=1; }
+grep -q 'too deep to keep' "$tmp/err12" || { echo "FAIL: %debug after infinite recursion"; fail=1; }
+
 if [ "$fail" -eq 0 ]; then echo "smoke: ok"; else for f in "$tmp"/out* "$tmp"/err*; do echo "--- $f ---"; cat "$f"; done; fi
 exit "$fail"

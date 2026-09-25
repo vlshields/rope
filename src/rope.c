@@ -14,6 +14,10 @@
  * Milestone 5: data frames. Printing a data.frame lays it out for the
  * terminal: as many columns as fit the width, head and tail rows to fit the
  * height, types under the names, colour. %page shows any value in a pager.
+ * Milestone 6: the inspector and the debugger. %who and %inspect describe
+ * objects without forcing promises; at a browser() prompt Rope shows the
+ * source around the current line, %where the stack, %up and %down move
+ * between frames, and %debug browses the frames of the last uncaught error.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -46,6 +50,7 @@ extern void run_Rmainloop(void);
 extern Rboolean R_Visible;          /* set by eval: would the REPL autoprint? */
 extern char R_ParseErrorMsg[];      /* filled in when R_ParseVector fails    */
 extern int R_interrupts_pending;    /* set by R's SIGINT handler             */
+extern SEXP R_Srcref;               /* srcref of the statement being evaluated */
 
 #ifndef ROPE_R_HOME
 #define ROPE_R_HOME "/usr/lib/R"
@@ -175,6 +180,12 @@ static void rope_out_push(int n, SEXP expr, SEXP value)
  */
 static int rope_out_skip_next = 0;
 
+/*
+ * A line typed in the debugger with another frame selected is handed to R
+ * rewritten; In should still show what was typed.
+ */
+static SEXP rope_out_expr_override = NULL;
+
 /* .Call entry points. */
 
 /*
@@ -189,6 +200,10 @@ static SEXP rope_out_record(SEXP expr, SEXP value, SEXP visible)
     if (rope_out_skip_next) {
         rope_out_skip_next = 0;
         return Rf_ScalarLogical(TRUE);
+    }
+    if (rope_out_expr_override) {
+        expr = rope_out_expr_override;
+        rope_out_expr_override = NULL;
     }
     int n = rope_evaldepth > 0 ? rope_evaln[--rope_evaldepth] : rope_input_n;
     if (Rf_asLogical(visible) == TRUE && value != R_NilValue)
@@ -248,6 +263,16 @@ static SEXP rope_input_number(void)
 static SEXP rope_term(void);
 static SEXP rope_frame_show(SEXP spec, SEXP page);
 static SEXP rope_page_text(SEXP lines);
+static SEXP rope_colour_on(void);
+
+/* The inspector and the debugger, defined further down. */
+static SEXP rope_cmd_arg(void);
+static SEXP rope_peek(SEXP env, SEXP names);
+static SEXP rope_dbg_here(void);
+static SEXP rope_dbg_depth_r(void);
+static SEXP rope_dbg_up_r(SEXP set);
+static SEXP rope_dbg_quiet_r(void);
+static SEXP rope_dbg_exprs_r(void);
 
 #define ROPE_FN(f) ((DL_FUNC)(void (*)(void))(f))
 
@@ -259,6 +284,14 @@ static const R_CallMethodDef rope_call_methods[] = {
     { "rope_term",         ROPE_FN(rope_term),         0 },
     { "rope_frame_show",   ROPE_FN(rope_frame_show),   2 },
     { "rope_page_text",    ROPE_FN(rope_page_text),    1 },
+    { "rope_colour_on",    ROPE_FN(rope_colour_on),    0 },
+    { "rope_cmd_arg",      ROPE_FN(rope_cmd_arg),      0 },
+    { "rope_peek",         ROPE_FN(rope_peek),         2 },
+    { "rope_dbg_here",     ROPE_FN(rope_dbg_here),     0 },
+    { "rope_dbg_depth",    ROPE_FN(rope_dbg_depth_r),  0 },
+    { "rope_dbg_up",       ROPE_FN(rope_dbg_up_r),     1 },
+    { "rope_dbg_quiet",    ROPE_FN(rope_dbg_quiet_r),  0 },
+    { "rope_dbg_exprs",    ROPE_FN(rope_dbg_exprs_r),  0 },
     { NULL, NULL, 0 }
 };
 
@@ -479,6 +512,430 @@ static const char rope_r_setup[] =
     "      if (inherits(x, 'tbl_df')) print(x, n = Inf, width = Inf) else print(x))\n"
     "    invisible(.Call('rope_page_text', lines))\n"
     "  }\n"
+    "  # -- inspector and debugger --\n"
+    "  utf8 <- function() isTRUE(l10n_info()[['UTF-8']])\n"
+    "  term_width <- function() { t <- .Call('rope_term'); if (is.null(t)) 80L else t[1L] }\n"
+    "  sgr <- function(code, s) if (.Call('rope_colour_on')) paste0('\\033[', code, 'm', s, '\\033[0m') else s\n"
+    "  dimmed <- function(s) sgr('90', s)\n"
+    "  bold <- function(s) sgr('1', s)\n"
+    "  say <- function(...) cat('rope: ', ..., '\\n', sep = '', file = stderr())\n"
+    "  ell <- function() if (utf8()) '…' else '~'\n"
+    "  fit <- function(s, w) frame_fit(s, max(4L, w), ell())\n"
+    "  pad <- function(s, w) paste0(s, strrep(' ', pmax(0L, w - frame_width(s))))\n"
+    "  big <- function(k) format(k, big.mark = ',', scientific = FALSE, trim = TRUE)\n"
+    "  one_line <- function(x, w = 500L) {\n"
+    "    if (is.language(x)) attributes(x) <- NULL\n"
+    "    s <- paste(trimws(deparse(x, width.cutoff = 500L, nlines = 5L)), collapse = ' ')\n"
+    "    fit(s, w)\n"
+    "  }\n"
+    "  first_line <- function(s) sub('\\n.*', '', paste(s, collapse = ' '))\n"
+    "  size_of <- function(x) format(utils::object.size(x), units = 'auto', standard = 'SI')\n"
+    "\n"
+    "  shape <- function(x) {\n"
+    "    times <- if (utf8()) '×' else 'x'\n"
+    "    if (is.data.frame(x)) return(sprintf('%s [%s %s %s]', class(x)[1L], big(nrow(x)), times, big(length(x))))\n"
+    "    if (is.primitive(x)) return('builtin')\n"
+    "    if (is.function(x)) return('function')\n"
+    "    if (is.environment(x)) return('environment')\n"
+    "    if (isS4(x)) return(paste('S4', class(x)[1L]))\n"
+    "    if (is.null(x)) return('NULL')\n"
+    "    if (is.symbol(x)) return('symbol')\n"
+    "    if (is.language(x)) return(class(x)[1L])\n"
+    "    if (is.list(x) && is.object(x)) return(class(x)[1L])\n"
+    "    d <- dim(x)\n"
+    "    n <- if (length(d)) paste(big(d), collapse = paste0(' ', times, ' ')) else big(length(x))\n"
+    "    sprintf('%s [%s]', frame_type(x), n)\n"
+    "  }\n"
+    "  signature <- function(f) {\n"
+    "    a <- if (is.primitive(f)) args(f) else f\n"
+    "    if (is.null(a)) return('function(...)')\n"
+    "    s <- deparse(a)\n"
+    "    s <- if (is.primitive(f)) s[-length(s)] else s[seq_len(max(1L, grep(')', s, fixed = TRUE)[1L]))]\n"
+    "    s <- paste(trimws(s), collapse = ' ')\n"
+    "    s <- sub('^function \\\\(', 'function(', s)\n"
+    "    regmatches(s, regexpr('^function\\\\(.*\\\\)', s))\n"
+    "  }\n"
+    "  env_label <- function(e) {\n"
+    "    n <- environmentName(e)\n"
+    "    if (identical(e, globalenv())) 'R_GlobalEnv'\n"
+    "    else if (isNamespace(e)) paste0('namespace:', n)\n"
+    "    else if (nzchar(n)) n\n"
+    "    else sub('^<environment: (.*)>$', '\\\\1', format(e))\n"
+    "  }\n"
+    "  preview <- function(x, w) {\n"
+    "    s <- if (is.function(x)) signature(x)\n"
+    "    else if (is.data.frame(x)) paste(names(x), collapse = ', ')\n"
+    "    else if (is.environment(x)) sprintf('%s, %s objects', env_label(x), big(length(x)))\n"
+    "    else if (isS4(x)) paste0('@', methods::slotNames(x), collapse = ' ')\n"
+    "    else if (is.language(x)) one_line(x)\n"
+    "    else if (is.list(x)) {\n"
+    "      if (!is.null(names(x))) paste0('$', names(x)[seq_len(min(length(x), 30L))], collapse = ' ')\n"
+    "      else sprintf('%s elements', big(length(x)))\n"
+    "    } else if (is.atomic(x) && length(x)) {\n"
+    "      v <- x[seq_len(min(length(x), 40L))]\n"
+    "      if (is.character(v)) { v <- encodeString(v, quote = '\"'); v[is.na(x[seq_along(v)])] <- 'NA' }\n"
+    "      else v <- trimws(frame_cells(v, ''))\n"
+    "      paste(v, collapse = ' ')\n"
+    "    } else ''\n"
+    "    fit(s, w)\n"
+    "  }\n"
+    "\n"
+    "  # The binding for each name in `env`, without forcing a promise or calling an\n"
+    "  # active binding: list(kind, value) with kind one of value, promise, active,\n"
+    "  # missing, dots.\n"
+    "  peek <- function(env, names) .Call('rope_peek', env, names)\n"
+    "  describe <- function(b) switch(b$kind,\n"
+    "    value   = list(type = shape(b$value), size = size_of(b$value), value = b$value),\n"
+    "    promise = list(type = 'promise', size = '', text = paste('not yet evaluated:', one_line(b$value))),\n"
+    "    active  = list(type = 'active binding', size = '', text = ''),\n"
+    "    missing = list(type = 'missing argument', size = '', text = ''),\n"
+    "    dots    = list(type = '...', size = '', text = ''),\n"
+    "    list(type = '?', size = '', text = ''))\n"
+    "\n"
+    "  obj_table <- function(env, names, limit = Inf) {\n"
+    "    if (!length(names)) { cat(dimmed('no objects'), '\\n', sep = ''); return(invisible()) }\n"
+    "    more <- length(names) - limit\n"
+    "    if (more > 0L) names <- names[seq_len(limit)]\n"
+    "    d <- lapply(peek(env, names), describe)\n"
+    "    w <- term_width()\n"
+    "    nw <- min(24L, max(4L, frame_width(names)))\n"
+    "    types <- vapply(d, `[[`, '', 'type')\n"
+    "    tw <- min(28L, max(4L, frame_width(types)))\n"
+    "    sizes <- vapply(d, `[[`, '', 'size')\n"
+    "    sw <- max(4L, frame_width(sizes))\n"
+    "    vw <- w - nw - tw - sw - 6L\n"
+    "    cat(dimmed(sub(' +$', '', paste(pad('name', nw), pad('type', tw), pad('size', sw), 'value', sep = '  '))), '\\n', sep = '')\n"
+    "    for (i in seq_along(names)) {\n"
+    "      v <- if (is.null(d[[i]]$text)) preview(d[[i]]$value, vw) else fit(d[[i]]$text, vw)\n"
+    "      line <- paste(pad(fit(names[i], nw), nw), pad(fit(types[i], tw), tw),\n"
+    "                    pad(sizes[i], sw), v, sep = '  ')\n"
+    "      cat(sub(' +$', '', line), '\\n', sep = '')\n"
+    "    }\n"
+    "    if (more > 0L) cat(dimmed(sprintf('# %s more', big(more))), '\\n', sep = '')\n"
+    "    invisible()\n"
+    "  }\n"
+    "  who <- function(env, pattern) {\n"
+    "    names <- if (nzchar(pattern)) grep(pattern, ls(env, all.names = TRUE), value = TRUE)\n"
+    "             else ls(env)\n"
+    "    obj_table(env, names)\n"
+    "  }\n"
+    "\n"
+    "  field <- function(key, value) cat('  ', dimmed(pad(key, 11L)), ' ', value, '\\n', sep = '')\n"
+    "  summary_of <- function(v) {\n"
+    "    ok <- v[!is.na(v)]\n"
+    "    if (!length(ok)) return('')\n"
+    "    if (is.factor(v)) {\n"
+    "      t <- sort(table_counts(v), decreasing = TRUE)\n"
+    "      top <- utils::head(t, 5L)\n"
+    "      s <- paste(sprintf('%s (%s)', names(top), big(as.integer(top))), collapse = ', ')\n"
+    "      if (length(t) > 5L) s <- paste0(s, ', ', ell())\n"
+    "      return(sprintf('%s levels: %s', big(nlevels(v)), s))\n"
+    "    }\n"
+    "    if (is.logical(v)) return(sprintf('TRUE %s, FALSE %s', big(sum(ok)), big(sum(!ok))))\n"
+    "    if (is.character(v)) return(sprintf('%s unique', big(length(unique(ok)))))\n"
+    "    if (inherits(v, c('Date', 'POSIXt'))) return(paste(format(range(ok)), collapse = ' to '))\n"
+    "    if (is.numeric(v) && !is.object(v)) {\n"
+    "      q <- c(min(ok), stats::median(ok), mean(ok), max(ok))\n"
+    "      f <- vapply(q, function(v) format(signif(v, 4L), scientific = 6L), '')\n"
+    "      return(sprintf('min %s, median %s, mean %s, max %s', f[1L], f[2L], f[3L], f[4L]))\n"
+    "    }\n"
+    "    ''\n"
+    "  }\n"
+    "  table_counts <- function(v) base::table(v, useNA = 'no')\n"
+    "  nas <- function(v) if (is.atomic(v)) sum(is.na(v)) else 0L\n"
+    "\n"
+    "  inspect_value <- function(label, x) {\n"
+    "    w <- term_width()\n"
+    "    cat(bold(label), '  ', shape(x), '  ', dimmed(size_of(x)), '\\n', sep = '')\n"
+    "    if (is.object(x) && length(class(x)) > 1L) field('class', paste(class(x), collapse = ', '))\n"
+    "    if (is.function(x)) {\n"
+    "      field('signature', fit(signature(x), w - 16L))\n"
+    "      if (!is.primitive(x)) {\n"
+    "        field('environment', env_label(environment(x)))\n"
+    "        sr <- attr(x, 'srcref')\n"
+    "        field('source', if (is.null(sr)) 'none kept' else src_label(sr, TRUE))\n"
+    "        b <- body(x)\n"
+    "        if (is.call(b) && identical(b[[1L]], as.name('UseMethod'))) field('generic', 'S3, dispatches on its first argument')\n"
+    "      }\n"
+    "    } else if (is.environment(x)) {\n"
+    "      field('name', env_label(x))\n"
+    "      if (!identical(x, emptyenv())) field('parent', env_label(parent.env(x)))\n"
+    "      field('objects', big(length(x)))\n"
+    "      if (length(x)) { cat('\\n'); obj_table(x, sort(ls(x, all.names = TRUE)), limit = 30L) }\n"
+    "    } else if (is.data.frame(x)) {\n"
+    "      if (length(x)) {\n"
+    "        nm <- names(x)\n"
+    "        nw <- min(24L, max(frame_width(nm)))\n"
+    "        types <- vapply(x, function(v) paste0('<', frame_type(v), '>'), '')\n"
+    "        tw <- max(frame_width(types))\n"
+    "        show <- seq_len(min(length(x), 50L))\n"
+    "        for (j in show) {\n"
+    "          v <- x[[j]]\n"
+    "          na <- nas(v)\n"
+    "          s <- summary_of(v)\n"
+    "          if (na) s <- paste0(if (nzchar(s)) paste0(s, ', ') else '', sgr('31', paste(big(na), 'NA')))\n"
+    "          cat('  ', pad(fit(nm[j], nw), nw), '  ', dimmed(pad(types[j], tw)), '  ',\n"
+    "              fit(s, w - nw - tw - 6L), '\\n', sep = '')\n"
+    "        }\n"
+    "        if (length(x) > length(show)) cat(dimmed(sprintf('  # %s more columns', big(length(x) - length(show)))), '\\n', sep = '')\n"
+    "      }\n"
+    "    } else if (isS4(x)) {\n"
+    "      sl <- methods::slotNames(x)\n"
+    "      if (length(sl)) {\n"
+    "        nw <- max(frame_width(sl)) + 1L\n"
+    "        for (s in sl) {\n"
+    "          v <- methods::slot(x, s)\n"
+    "          cat('  ', pad(paste0('@', s), nw), '  ', dimmed(shape(v)), '  ', preview(v, w - nw - 20L), '\\n', sep = '')\n"
+    "        }\n"
+    "      }\n"
+    "    } else if (is.language(x)) {\n"
+    "      src <- deparse(x)\n"
+    "      for (l in utils::head(src, 10L)) cat('  ', l, '\\n', sep = '')\n"
+    "      if (length(src) > 10L) cat(dimmed(sprintf('  # %s more lines', big(length(src) - 10L))), '\\n', sep = '')\n"
+    "    } else if (is.list(x)) {\n"
+    "      elements(x, 1L, w)\n"
+    "    } else if (is.atomic(x)) {\n"
+    "      na <- nas(x)\n"
+    "      if (length(x)) {\n"
+    "        s <- summary_of(x)\n"
+    "        if (nzchar(s)) field('summary', fit(s, w - 16L))\n"
+    "        field('NA', big(na))\n"
+    "        field('values', preview(x, w - 16L))\n"
+    "      }\n"
+    "    }\n"
+    "    known <- c('names', 'dim', 'dimnames', 'class', 'row.names', 'levels', 'srcref', 'comment')\n"
+    "    other <- setdiff(names(attributes(x)), known)\n"
+    "    if (is.language(x) || is.function(x)) other <- setdiff(other, c('srcfile', 'wholeSrcref'))\n"
+    "    if (length(other)) field('attributes', fit(paste(other, collapse = ', '), w - 16L))\n"
+    "    invisible()\n"
+    "  }\n"
+    "  elements <- function(x, depth, w) {\n"
+    "    n <- length(x)\n"
+    "    show <- seq_len(min(n, 20L))\n"
+    "    nm <- names(x)\n"
+    "    labels <- if (is.null(nm)) sprintf('[[%d]]', show) else ifelse(nzchar(nm[show]), paste0('$', nm[show]), sprintf('[[%d]]', show))\n"
+    "    lw <- max(frame_width(labels))\n"
+    "    indent <- strrep('  ', depth)\n"
+    "    for (i in show) {\n"
+    "      v <- x[[i]]\n"
+    "      t <- shape(v)\n"
+    "      p <- preview(v, w - frame_width(indent) - lw - frame_width(t) - 4L)\n"
+    "      cat(indent, pad(labels[i], lw), '  ', dimmed(t), if (nzchar(p)) paste0('  ', p), '\\n', sep = '')\n"
+    "      if (depth < 2L && is.list(v) && !is.data.frame(v) && !is.object(v) && length(v))\n"
+    "        elements(v, depth + 1L, w)\n"
+    "    }\n"
+    "    if (n > length(show)) cat(indent, dimmed(sprintf('# %s more', big(n - length(show)))), '\\n', sep = '')\n"
+    "  }\n"
+    "  inspect <- function(env, text) {\n"
+    "    if (!nzchar(text)) return(say('usage: %inspect EXPR'))\n"
+    "    e <- tryCatch(parse(text = text, keep.source = FALSE), error = function(e) e)\n"
+    "    if (inherits(e, 'error')) return(say('parse error: ', conditionMessage(e)))\n"
+    "    if (length(e) != 1L) return(say('%inspect takes one expression'))\n"
+    "    e <- e[[1L]]\n"
+    "    if (is.symbol(e) && exists(as.character(e), envir = env, inherits = FALSE)) {\n"
+    "      b <- peek(env, as.character(e))[[1L]]\n"
+    "      if (b$kind != 'value') {\n"
+    "        d <- describe(b)\n"
+    "        cat(bold(text), '  ', d$type, '\\n', sep = '')\n"
+    "        if (b$kind == 'promise') {\n"
+    "          field('expression', one_line(b$value, term_width() - 16L))\n"
+    "          field('note', sprintf('not forced; %%inspect (%s) evaluates it', text))\n"
+    "        }\n"
+    "        return(invisible())\n"
+    "      }\n"
+    "      return(inspect_value(text, b$value))\n"
+    "    }\n"
+    "    inspect_value(text, eval(e, env))\n"
+    "  }\n"
+    "\n"
+    "  # -- debugger --\n"
+    "  # Where each frame is stopped: frame i at the srcref of call i + 1, the\n"
+    "  # innermost at the position R last announced ('debug at', 'Called from').\n"
+    "  state <- new.env()\n"
+    "  arrow <- function() if (utf8()) '→' else '>'\n"
+    "  machinery <- function(f, h)\n"
+    "    is.primitive(f) || identical(f, h) || identical(f, stop) || identical(f, warning) ||\n"
+    "      identical(f, .handleSimpleError) || identical(f, .signalSimpleWarning) ||\n"
+    "      identical(f, signalCondition)\n"
+    "  record_error <- function(cond, n, calls, frames, h) {\n"
+    "    k <- n\n"
+    "    while (k > 1L && machinery(sys.function(k - 1L), h)) k <- k - 1L\n"
+    "    m <- k - 1L\n"
+    "    state$dump <- list(calls = calls[seq_len(m)], frames = frames[seq_len(m)],\n"
+    "                       fns = lapply(seq_len(m), sys.function),\n"
+    "                       locs = lapply(calls[seq_len(m) + 1L], attr, 'srcref'),\n"
+    "                       message = conditionMessage(cond),\n"
+    "                       call = conditionCall(cond))\n"
+    "  }\n"
+    "  on_error <- function(cond) {\n"
+    "    # Near the expression limit there is room for little more than this.\n"
+    "    state$dump <- list(lost = TRUE, message = cond$message)\n"
+    "    n <- sys.nframe()\n"
+    "    calls <- sys.calls()\n"
+    "    frames <- sys.frames()\n"
+    "    tryCatch(record_error(cond, n, calls, frames, on_error), error = function(e) NULL)\n"
+    "  }\n"
+    "  live <- function(k0) {\n"
+    "    if (k0 < 1L) return(NULL)\n"
+    "    calls <- sys.calls()[seq_len(k0)]\n"
+    "    list(calls = calls, frames = lapply(seq_len(k0), sys.frame),\n"
+    "         fns = lapply(seq_len(k0), sys.function),\n"
+    "         locs = c(lapply(calls[-1L], attr, 'srcref'), list(.Call('rope_dbg_here'))))\n"
+    "  }\n"
+    "  view <- function(k0) {\n"
+    "    depth <- .Call('rope_dbg_depth')\n"
+    "    pm <- state$pm\n"
+    "    if (!is.null(pm) && pm$depth == depth) return(pm)\n"
+    "    if (depth > 0L) live(k0)\n"
+    "  }\n"
+    "  selected <- function(v) {\n"
+    "    n <- length(v$frames)\n"
+    "    max(1L, n - .Call('rope_dbg_up', NULL))\n"
+    "  }\n"
+    "  src_ok <- function(sr, fn) {\n"
+    "    fsr <- if (is.function(fn) && !is.primitive(fn)) attr(fn, 'srcref')\n"
+    "    is.integer(sr) && length(sr) >= 4L && !is.null(fsr) &&\n"
+    "      identical(attr(sr, 'srcfile'), attr(fsr, 'srcfile')) &&\n"
+    "      sr[1L] >= fsr[1L] && sr[3L] <= fsr[3L]\n"
+    "  }\n"
+    "  src_label <- function(sr, range = FALSE) {\n"
+    "    f <- attr(sr, 'srcfile')$filename\n"
+    "    f <- if (is.null(f) || !nzchar(f)) 'line ' else paste0(basename(f), ':')\n"
+    "    if (range && sr[3L] != sr[1L]) sprintf('%s%d-%d', f, sr[1L], sr[3L]) else paste0(f, sr[1L])\n"
+    "  }\n"
+    "  listing <- function(sr, fn, before, after) {\n"
+    "    fsr <- attr(fn, 'srcref')\n"
+    "    from <- max(fsr[1L], sr[1L] - before)\n"
+    "    to <- min(fsr[3L], sr[1L] + after)\n"
+    "    lines <- getSrcLines(attr(sr, 'srcfile'), from, to)\n"
+    "    if (!length(lines)) return(FALSE)\n"
+    "    w <- nchar(as.character(from + length(lines) - 1L))\n"
+    "    for (i in seq_along(lines)) {\n"
+    "      k <- from + i - 1L\n"
+    "      num <- formatC(k, width = w)\n"
+    "      text <- sub('\\\\s+$', '', lines[i])\n"
+    "      if (k == sr[1L]) cat(bold(paste0(arrow(), ' ', num, '  ', text)), '\\n', sep = '')\n"
+    "      else if (k > sr[1L] && k <= sr[3L]) cat(bold(paste0('  ', num, '  ', text)), '\\n', sep = '')\n"
+    "      else cat('  ', dimmed(num), '  ', text, '\\n', sep = '')\n"
+    "    }\n"
+    "    TRUE\n"
+    "  }\n"
+    "  not_debugging <- function() {\n"
+    "    say('not in the debugger (%debug browses the last error)')\n"
+    "    invisible()\n"
+    "  }\n"
+    "  here <- function(k0, before = 2L, after = 2L, header = FALSE) {\n"
+    "    v <- view(k0)\n"
+    "    if (is.null(v) || !length(v$frames)) return(invisible())\n"
+    "    i <- selected(v)\n"
+    "    sr <- v$locs[[i]]\n"
+    "    ok <- src_ok(sr, v$fns[[i]])\n"
+    "    if (!ok && !header) return(invisible())  # R has shown the expression\n"
+    "    if (header) where_line(v, i, i, nchar(length(v$frames)), term_width())\n"
+    "    if (ok) listing(sr, v$fns[[i]], before, after)\n"
+    "    else cat(dimmed('  no source for this frame'), '\\n', sep = '')\n"
+    "    invisible()\n"
+    "  }\n"
+    "  where_line <- function(v, i, sel, nw, w) {\n"
+    "    sr <- v$locs[[i]]\n"
+    "    loc <- if (src_ok(sr, v$fns[[i]])) src_label(sr) else ''\n"
+    "    mark <- if (i == sel) arrow() else ' '\n"
+    "    call <- one_line(v$calls[[i]], w - nw - frame_width(loc) - 6L)\n"
+    "    cat(mark, ' ', formatC(i, width = nw), '  ', call,\n"
+    "        if (nzchar(loc)) paste0('  ', dimmed(loc)), '\\n', sep = '')\n"
+    "  }\n"
+    "  where <- function(k0) {\n"
+    "    v <- view(k0)\n"
+    "    if (is.null(v)) {\n"
+    "      v <- state$dump\n"
+    "      if (is.null(v)) return(not_debugging())\n"
+    "      cat(dimmed(paste('last error:', fit(first_line(v$message), term_width() - 12L))), '\\n', sep = '')\n"
+    "      if (isTRUE(v$lost)) return(cat(dimmed('  its stack was too deep to keep'), '\\n', sep = ''))\n"
+    "      if (!length(v$frames)) return(cat(dimmed('  at top level'), '\\n', sep = ''))\n"
+    "      sel <- 0L\n"
+    "    } else {\n"
+    "      if (!length(v$frames)) return(cat(dimmed('at top level'), '\\n', sep = ''))\n"
+    "      sel <- selected(v)\n"
+    "    }\n"
+    "    w <- term_width()\n"
+    "    nw <- nchar(length(v$frames))\n"
+    "    for (i in seq_along(v$frames)) where_line(v, i, sel, nw, w)\n"
+    "    invisible()\n"
+    "  }\n"
+    "  move <- function(k0, how, arg) {\n"
+    "    v <- view(k0)\n"
+    "    if (is.null(v) || !length(v$frames)) return(not_debugging())\n"
+    "    n <- length(v$frames)\n"
+    "    k <- suppressWarnings(as.integer(arg))\n"
+    "    if (nzchar(arg) && (is.na(k) || k < 0L)) return(say('%', how, ' takes a frame count, not \"', arg, '\"'))\n"
+    "    i <- selected(v)\n"
+    "    to <- switch(how, up = i - (if (nzchar(arg)) k else 1L),\n"
+    "                      down = i + (if (nzchar(arg)) k else 1L),\n"
+    "                      frame = if (nzchar(arg)) k else i)\n"
+    "    if (to < 1L) { if (i == 1L) return(say('already at the outermost frame')); to <- 1L }\n"
+    "    if (to > n) { if (i == n) return(say('already at the innermost frame')); to <- n }\n"
+    "    .Call('rope_dbg_up', n - to)\n"
+    "    here(k0, header = TRUE)\n"
+    "  }\n"
+    "  list_source <- function(k0, arg) {\n"
+    "    v <- view(k0)\n"
+    "    if (is.null(v) || !length(v$frames)) return(not_debugging())\n"
+    "    k <- suppressWarnings(as.integer(arg))\n"
+    "    if (nzchar(arg) && (is.na(k) || k < 0L)) return(say('%list takes a line count, not \"', arg, '\"'))\n"
+    "    if (!nzchar(arg)) k <- 10000L\n"
+    "    here(k0, k, k, header = TRUE)\n"
+    "  }\n"
+    "  eval_selected <- function(k0, rho) {\n"
+    "    v <- view(k0)\n"
+    "    env <- if (is.null(v) || !length(v$frames)) rho else v$frames[[selected(v)]]\n"
+    "    exprs <- .Call('rope_dbg_exprs')\n"
+    "    r <- list(value = invisible(), visible = FALSE)\n"
+    "    for (i in seq_along(exprs)) {\n"
+    "      if (i > 1L && r$visible) {\n"
+    "        if (isS4(r$value)) methods::show(r$value) else print(r$value)\n"
+    "      }\n"
+    "      r <- withVisible(eval(exprs[[i]], env))\n"
+    "    }\n"
+    "    if (r$visible) r$value else invisible(r$value)\n"
+    "  }\n"
+    "  target <- function(k0, rho) {\n"
+    "    v <- view(k0)\n"
+    "    if (is.null(v) || !length(v$frames) || .Call('rope_dbg_up', NULL) == 0L) rho\n"
+    "    else v$frames[[selected(v)]]\n"
+    "  }\n"
+    "  postmortem <- function() {\n"
+    "    d <- state$dump\n"
+    "    if (is.null(d)) return(say('no error to debug'))\n"
+    "    if (isTRUE(d$lost)) return(say('the stack of the last error was too deep to keep'))\n"
+    "    n <- length(d$frames)\n"
+    "    if (!n) return(say('the last error happened at top level: nothing to browse'))\n"
+    "    old <- state$pm\n"
+    "    on.exit(state$pm <- old)\n"
+    "    state$pm <- c(d, list(depth = .Call('rope_dbg_depth') + 1L))\n"
+    "    msg <- first_line(d$message)\n"
+    "    if (!is.null(d$call)) msg <- paste0(one_line(d$call), ': ', msg)\n"
+    "    cat(dimmed(paste('post-mortem of', fit(msg, term_width() - 20L))), '\\n', sep = '')\n"
+    "    cat(dimmed('(%where, %up, %down to move, c or Q to leave)'), '\\n', sep = '')\n"
+    "    .Call('rope_dbg_quiet')\n"
+    "    eval(quote(browser()), d$frames[[n]])\n"
+    "  }\n"
+    "\n"
+    "  env$.rope_run <- function(cmd) {\n"
+    "    rho <- parent.frame()\n"
+    "    k0 <- sys.parent()\n"
+    "    arg <- .Call('rope_cmd_arg')\n"
+    "    switch(cmd,\n"
+    "      eval    = return(eval_selected(k0, rho)),\n"
+    "      here    = here(k0),\n"
+    "      where   = where(k0),\n"
+    "      up      = , down = , frame = move(k0, cmd, arg),\n"
+    "      list    = list_source(k0, arg),\n"
+    "      debug   = postmortem(),\n"
+    "      init    = globalCallingHandlers(error = on_error),\n"
+    "      who     = who(target(k0, rho), arg),\n"
+    "      inspect = inspect(target(k0, rho), arg))\n"
+    "    invisible(.Last.value)\n"
+    "  }\n"
     "  attach(env, name = 'rope', warn.conflicts = FALSE)\n"
     "  addTaskCallback(function(expr, value, ok, visible)\n"
     "    .Call('rope_out_record', expr, value, visible), name = 'rope')\n"
@@ -543,6 +1000,11 @@ static int rope_colour(void)
 {
     const char *no = getenv("NO_COLOR");
     return rope_term_usable() && !(no && *no);
+}
+
+static SEXP rope_colour_on(void)
+{
+    return Rf_ScalarLogical(rope_colour());
 }
 
 #define ROPE_SGR_DIM  "\x1b[90m"
@@ -1018,12 +1480,275 @@ static int rope_eval_text(const char *text, struct rope_clock *secs,
     return ok;
 }
 
+/* ---- the inspector and the debugger -------------------------------------- */
+
+/*
+ * Most of both lives in R (the tail of rope_r_setup), because it has to look
+ * at R's call stack from inside it. A command such as %where is handed to R
+ * as the line .rope_run("where"), which R's own REPL evaluates: at a browser
+ * prompt that happens in the frame being browsed, with the whole stack below
+ * it, so sys.calls() and sys.frames() see what the user sees. The command's
+ * argument text waits here for .rope_run to collect.
+ */
+static char *rope_cmd_arg_text = NULL;
+
+static SEXP rope_cmd_arg(void)
+{
+    return Rf_mkString(rope_cmd_arg_text ? rope_cmd_arg_text : "");
+}
+
+/* Hold `value` in *slot, releasing what was there. NULL empties the slot. */
+static void rope_keep(SEXP *slot, SEXP value)
+{
+    if (*slot) R_ReleaseObject(*slot);
+    *slot = value;
+    if (value) R_PreserveObject(value);
+}
+
+/*
+ * rope_peek(env, names): the binding of each name in env itself, without
+ * forcing a promise or calling an active binding. One list(kind, value) per
+ * name: "value" and the value (a forced promise counts as its value),
+ * "promise" and its expression, "active", "missing" (an argument not
+ * supplied), "dots" or "none".
+ */
+static SEXP rope_peek(SEXP env, SEXP names)
+{
+    if (TYPEOF(env) != ENVSXP || TYPEOF(names) != STRSXP) return R_NilValue;
+    R_xlen_t n = XLENGTH(names);
+    SEXP out = PROTECT(Rf_allocVector(VECSXP, n));
+    SEXP fields = PROTECT(Rf_allocVector(STRSXP, 2));
+    SET_STRING_ELT(fields, 0, Rf_mkChar("kind"));
+    SET_STRING_ELT(fields, 1, Rf_mkChar("value"));
+    for (R_xlen_t i = 0; i < n; i++) {
+        SEXP sym = Rf_installTrChar(STRING_ELT(names, i));
+        const char *kind = "value";
+        SEXP v = R_NilValue;
+        if (!R_existsVarInFrame(env, sym)) {
+            kind = "none";
+        } else if (R_BindingIsActive(sym, env)) {
+            kind = "active";
+        } else {
+            v = Rf_findVarInFrame(env, sym);
+            if (v == R_MissingArg) {
+                kind = "missing";
+                v = R_NilValue;
+            } else if (TYPEOF(v) == DOTSXP) {
+                kind = "dots";
+                v = R_NilValue;
+            } else if (TYPEOF(v) == PROMSXP) {
+                if (PRVALUE(v) != R_UnboundValue) {
+                    v = PRVALUE(v);
+                } else {
+                    kind = "promise";
+                    v = R_PromiseExpr(v);
+                }
+            }
+        }
+        PROTECT(v);
+        SEXP b = PROTECT(Rf_allocVector(VECSXP, 2));
+        SET_VECTOR_ELT(b, 0, Rf_mkString(kind));
+        SET_VECTOR_ELT(b, 1, v);
+        Rf_setAttrib(b, R_NamesSymbol, fields);
+        SET_VECTOR_ELT(out, i, b);
+        UNPROTECT(2);
+    }
+    UNPROTECT(2);
+    return out;
+}
+
+/*
+ * Where the browser is stopped. R announces every stop on the console, with
+ * "debug at FILE#LINE: ", "debug: " (no source kept) or, for an explicit
+ * browser() call, "Called from: ". At that moment R_Srcref is the srcref of
+ * the statement concerned, so it is taken as the text goes by. The next
+ * browser prompt files it under its depth and shows the source around it.
+ * The R side checks that a srcref really lies inside the frame's function
+ * before trusting it.
+ */
+static SEXP rope_dbg_pending = NULL;          /* announced, prompt not yet seen */
+static int rope_dbg_fresh = 0;                /* a stop since the last prompt?  */
+static SEXP rope_dbg_at[ROPE_MAX_DEPTH + 1];  /* stop per browser depth         */
+static int rope_dbg_depth = 0;                /* depth of the last prompt       */
+static int rope_dbg_up = 0;                   /* frames above the innermost     */
+static int rope_dbg_quiet = 0;                /* drop the next "Called from: "  */
+static int rope_dbg_swallow = 0;              /* ...and the rest of its line    */
+static SEXP rope_dbg_exprs = NULL;            /* a line for the selected frame  */
+
+static int rope_starts(const char *buf, int len, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    return (size_t)len >= n && memcmp(buf, prefix, n) == 0;
+}
+
+/* Console output from R goes past here first. Returns 1 to drop it. */
+static int rope_dbg_output(const char *buf, int len)
+{
+    if (rope_dbg_swallow) {
+        if (memchr(buf, '\n', (size_t)len)) rope_dbg_swallow = 0;
+        return 1;
+    }
+    int called = rope_starts(buf, len, "Called from: ");
+    if (!called && !rope_starts(buf, len, "debug at ") && !rope_starts(buf, len, "debug: "))
+        return 0;
+    if (called && rope_dbg_quiet) {       /* %debug's own browser() call */
+        rope_dbg_quiet = 0;
+        rope_dbg_swallow = memchr(buf, '\n', (size_t)len) == NULL;
+        return 1;
+    }
+    SEXP sr = R_Srcref;
+    int ok = sr && TYPEOF(sr) == INTSXP && XLENGTH(sr) >= 4 &&
+             TYPEOF(Rf_getAttrib(sr, Rf_install("srcfile"))) == ENVSXP;
+    rope_keep(&rope_dbg_pending, ok ? sr : NULL);
+    rope_dbg_fresh = 1;
+    return 0;
+}
+
+static int rope_browse_depth(const char *prompt)
+{
+    int depth = 0;
+    sscanf(prompt, "Browse[%d]> ", &depth);
+    if (depth < 0) depth = 0;
+    if (depth > ROPE_MAX_DEPTH) depth = ROPE_MAX_DEPTH;
+    return depth;
+}
+
+/*
+ * A prompt is about to be read. Keep track of the browser depth, and if the
+ * browser has just stopped somewhere new, answer the prompt ourselves with a
+ * line that shows where: R evaluates it in the browsed frame and asks again.
+ * Returns 1 if `buf` was filled.
+ */
+static int rope_dbg_prompt(const char *prompt, unsigned char *buf, int len)
+{
+    int depth = rope_browse_depth(prompt);
+
+    /*
+     * The first prompt of all is answered with the one piece of setup that
+     * has to run at R's own top level: registering the global error handler
+     * that keeps the stack of an uncaught error for %debug. Registered under
+     * R_ToplevelExec, it would be dropped again on the way out.
+     */
+    static int setup_done = 0;
+    if (!setup_done && depth == 0 && rope_env) {
+        setup_done = 1;
+        snprintf((char *)buf, (size_t)len, ".rope_run(\"init\")\n");
+        rope_out_skip_next = 1;
+        return 1;
+    }
+
+    for (int d = depth + 1; d <= rope_dbg_depth; d++) rope_keep(&rope_dbg_at[d], NULL);
+    if (depth != rope_dbg_depth) rope_dbg_up = 0;
+    rope_dbg_depth = depth;
+    rope_dbg_quiet = 0;
+    rope_dbg_swallow = 0;
+    if (!rope_dbg_fresh) return 0;
+    rope_dbg_fresh = 0;
+    if (depth > 0) rope_keep(&rope_dbg_at[depth], rope_dbg_pending);
+    rope_keep(&rope_dbg_pending, NULL);
+    if (depth == 0) return 0;
+    rope_dbg_up = 0;
+    snprintf((char *)buf, (size_t)len, ".rope_run(\"here\")\n");
+    rope_out_skip_next = 1;
+    return 1;
+}
+
+static int rope_in_list(const char *s, size_t n, const char *const *list);
+
+static const char *const rope_browser_cmds[] = {
+    "c", "cont", "n", "s", "f", "Q", "r", "where", "help", NULL
+};
+
+struct rope_parse_line { const char *text; SEXP exprs; ParseStatus status; };
+
+static void rope_parse_line_cb(void *data)
+{
+    struct rope_parse_line *pl = data;
+    SEXP src = PROTECT(Rf_mkString(pl->text));
+    pl->exprs = R_ParseVector(src, -1, &pl->status, R_NilValue);
+    if (pl->status == PARSE_OK) R_PreserveObject(pl->exprs);
+    UNPROTECT(1);
+}
+
+/*
+ * A line typed at a browser prompt. Browser commands go to R as they are;
+ * one that moves on (n, s, c, ...) or a blank line, which steps, also puts
+ * the selection back on the innermost frame. With an outer frame selected,
+ * R code is parsed here and handed over as .rope_run("eval"), which runs it
+ * in that frame. A line that does not parse goes to R unchanged, so R
+ * reports the error.
+ */
+static void rope_dbg_line(unsigned char *buf, int len)
+{
+    char *line = (char *)buf;
+    while (*line == ' ' || *line == '\t') line++;
+    size_t n = strlen(line);
+    while (n > 0 && isspace((unsigned char)line[n - 1])) n--;
+    if (n == 0) {
+        rope_dbg_up = 0;
+        return;
+    }
+    if (rope_in_list(line, n, rope_browser_cmds)) {
+        if (!(n == 5 && memcmp(line, "where", 5) == 0) && !(n == 4 && memcmp(line, "help", 4) == 0))
+            rope_dbg_up = 0;
+        return;
+    }
+    if (rope_dbg_up == 0) return;
+
+    struct rope_parse_line pl = { (const char *)buf, R_NilValue, PARSE_ERROR };
+    if (!R_ToplevelExec(rope_parse_line_cb, &pl) || pl.status != PARSE_OK) return;
+    rope_keep(&rope_dbg_exprs, pl.exprs);
+    R_ReleaseObject(pl.exprs);
+    R_xlen_t k = XLENGTH(pl.exprs);
+    if (k == 0) return;
+    rope_out_expr_override = VECTOR_ELT(pl.exprs, k - 1);
+    snprintf((char *)buf, (size_t)len, ".rope_run(\"eval\")\n");
+}
+
+/* rope_dbg_here(): the srcref the browser at the current depth stopped at. */
+static SEXP rope_dbg_here(void)
+{
+    SEXP sr = rope_dbg_at[rope_dbg_depth];
+    return sr ? sr : R_NilValue;
+}
+
+static SEXP rope_dbg_depth_r(void)
+{
+    return Rf_ScalarInteger(rope_dbg_depth);
+}
+
+/* rope_dbg_up(k): select the frame k above the innermost; NULL just asks. */
+static SEXP rope_dbg_up_r(SEXP set)
+{
+    if (set != R_NilValue) {
+        int k = Rf_asInteger(set);
+        rope_dbg_up = k == NA_INTEGER || k < 0 ? 0 : k;
+    }
+    return Rf_ScalarInteger(rope_dbg_up);
+}
+
+/* rope_dbg_quiet(): %debug is about to call browser() itself. Its "Called
+ * from" line is noise; the stop is known, so show it at the next prompt. */
+static SEXP rope_dbg_quiet_r(void)
+{
+    rope_dbg_quiet = 1;
+    rope_dbg_fresh = 1;
+    rope_keep(&rope_dbg_pending, NULL);
+    return R_NilValue;
+}
+
+static SEXP rope_dbg_exprs_r(void)
+{
+    return rope_dbg_exprs ? rope_dbg_exprs : Rf_allocVector(EXPRSXP, 0);
+}
+
 /* ---- front-end commands --------------------------------------------------- */
 
 /*
  * A command receives the rest of the line after its name, with surrounding
  * blanks stripped. It returns 1 if it evaluated R code, so that the caller can
- * let R flush deferred warnings afterwards, 0 otherwise.
+ * let R flush deferred warnings afterwards, 2 if R should run it as
+ * .rope_run("name"), 0 otherwise.
  */
 struct rope_cmd {
     const char *name;
@@ -1077,6 +1802,18 @@ static int rope_cmd_page(const struct rope_cmd *self, const char *arg)
     return 1;
 }
 
+/*
+ * Commands done in R: the argument is kept for .rope_run and R is handed
+ * .rope_run("name") in place of the line (see rope_intercept).
+ */
+static int rope_cmd_r(const struct rope_cmd *self, const char *arg)
+{
+    (void)self;
+    free(rope_cmd_arg_text);
+    rope_cmd_arg_text = strdup(arg);
+    return 2;
+}
+
 static int rope_cmd_help(const struct rope_cmd *self, const char *arg)
 {
     (void)self; (void)arg;
@@ -1096,6 +1833,22 @@ static const struct rope_cmd rope_cmds[] = {
       rope_cmd_time },
     { "page", "%page [EXPR]", "show the value of EXPR (default: the last value) in the pager",
       rope_cmd_page },
+    { "who", "%who [REGEX]", "list the objects here (the browsed frame in the debugger)",
+      rope_cmd_r },
+    { "inspect", "%inspect EXPR", "describe the value of EXPR: type, size, structure, source",
+      rope_cmd_r },
+    { "where", "%where", "the call stack being browsed, or that of the last error",
+      rope_cmd_r },
+    { "up", "%up [N]", "select the frame N (default 1) calls out, and show its source",
+      rope_cmd_r },
+    { "down", "%down [N]", "select the frame N (default 1) calls in, and show its source",
+      rope_cmd_r },
+    { "frame", "%frame [N]", "select frame N as %where numbers it (default: show this one)",
+      rope_cmd_r },
+    { "list", "%list [N]", "the source of the selected frame, N lines around (default: all)",
+      rope_cmd_r },
+    { "debug", "%debug", "browse the frames of the last uncaught error",
+      rope_cmd_r },
     { "help", "%help",      "list these commands", rope_cmd_help },
     { NULL, NULL, NULL, NULL }
 };
@@ -1151,8 +1904,11 @@ static int rope_intercept(const char *prompt, unsigned char *buf, int len)
      * ourselves, make it an expression rather than a blank so that R's loop
      * prints any deferred warnings now instead of after the next real input.
      */
-    snprintf((char *)buf, (size_t)len, "%s\n", evaluated ? "invisible(.Last.value)" : "");
-    rope_out_skip_next = evaluated;
+    if (evaluated == 2)
+        snprintf((char *)buf, (size_t)len, ".rope_run(\"%s\")\n", cmd->name);
+    else
+        snprintf((char *)buf, (size_t)len, "%s\n", evaluated ? "invisible(.Last.value)" : "");
+    rope_out_skip_next = evaluated != 0;
     return 1;
 }
 
@@ -1165,17 +1921,13 @@ static int rope_intercept(const char *prompt, unsigned char *buf, int len)
 static void rope_line_read(const char *prompt, unsigned char *buf, int len)
 {
     if (rope_busy) return;
-    if (!rope_is_continue_prompt(prompt)) {
-        int depth = 0;
-        sscanf(prompt, "Browse[%d]> ", &depth);
-        if (depth < 0) depth = 0;
-        if (depth > ROPE_MAX_DEPTH) depth = ROPE_MAX_DEPTH;
-        rope_evaldepth = depth;        /* anything deeper died in an error */
-        const char *p = (const char *)buf;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p != '\n' && *p != '\0') rope_input_n++;
-    }
-    rope_intercept(prompt, buf, len);
+    if (rope_is_continue_prompt(prompt)) return;
+    int depth = rope_browse_depth(prompt);
+    rope_evaldepth = depth;            /* anything deeper died in an error */
+    const char *p = (const char *)buf;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '\n' && *p != '\0') rope_input_n++;
+    if (!rope_intercept(prompt, buf, len) && depth > 0) rope_dbg_line(buf, len);
 }
 
 /* ---- line editor ---------------------------------------------------------- */
@@ -1464,6 +2216,16 @@ static int rope_read_console(const char *prompt, unsigned char *buf, int len,
 {
     char *line = NULL;
 
+    /*
+     * Leftovers from the previous line: they were for R's evaluation of it,
+     * which is over, whether or not it got as far as the task callback.
+     */
+    if (!rope_busy && !rope_is_continue_prompt(prompt)) {
+        rope_out_skip_next = 0;
+        rope_out_expr_override = NULL;
+        if (rope_dbg_prompt(prompt, buf, len)) return 1;
+    }
+
     if (!rope_editor_usable()) {
         /* Piped input or a dumb terminal: no editor, just lines. */
         if (isatty(STDIN_FILENO)) {
@@ -1532,6 +2294,7 @@ static int rope_read_console(const char *prompt, unsigned char *buf, int len,
 
 static void rope_write_console_ex(const char *buf, int len, int otype)
 {
+    if (otype == 0 && rope_dbg_output(buf, len)) return;
     FILE *f = otype ? stderr : stdout;
     fwrite(buf, 1, (size_t)len, f);
     fflush(f);
