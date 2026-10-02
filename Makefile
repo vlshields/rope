@@ -12,13 +12,18 @@ ISOCLINE ?= src/isocline
 ISOCLINE_CPPFLAGS := -I$(ISOCLINE)/include -DIC_MAX_HISTORY=10000
 
 SRC := src/rope.c
-OBJ := rope.o isocline.o
+OBJ := rope.o graphics.o isocline.o
 
 rope: $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS) $(LDLIBS)
 
 rope.o: $(SRC) $(ISOCLINE)/include/isocline.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(ISOCLINE_CPPFLAGS) -c -o $@ $(SRC)
+
+# The graphics device, with its own rasteriser; text comes from the vendored
+# stb_truetype.h (public domain).
+graphics.o: src/graphics.c src/stb_truetype.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ src/graphics.c
 
 isocline.o: $(ISOCLINE)/src/*.c $(ISOCLINE)/src/*.h $(ISOCLINE)/include/isocline.h
 	$(CC) -std=c11 -O2 -g -w $(ISOCLINE_CPPFLAGS) -c -o $@ $(ISOCLINE)/src/isocline.c
@@ -29,6 +34,7 @@ debug: clean rope
 check: rope
 	sh tests/smoke.sh
 	python3 tests/pty_test.py
+	python3 tests/graphics_test.py
 
 clean:
 	rm -f rope *.o

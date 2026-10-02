@@ -13,7 +13,8 @@ def spawn(histfile, env={}):
     if pid == 0:
         os.environ["ROPE_HISTFILE"] = histfile
         os.environ["TERM"] = "xterm"
-        for k in ("PAGER", "ROPE_PAGER", "LESS", "NO_COLOR"):
+        os.environ["ROPE_GRAPHICS"] = "none"   # no terminal query at startup
+        for k in ("PAGER", "ROPE_PAGER", "LESS", "NO_COLOR", "KITTY_WINDOW_ID"):
             os.environ.pop(k, None)
         os.environ.update(env)
         os.execv(ROPE, [ROPE])
@@ -259,6 +260,65 @@ with tempfile.TemporaryDirectory() as tmp:
     check("ctrl-c at the browser keeps the selected frame", b"[1] 1" in out)
     os.write(fd, b"c" + ENTER)
     read_until(fd, b"> ")
+    os.write(fd, b"q()" + ENTER)
+    wait_exit(pid)
+    os.close(fd)
+
+    # 13. Graphics at a terminal: a kitty TERM needs no query, the page is
+    # shown before the next prompt, and the size follows the window.
+    pending = b""
+    pid, fd = spawn(hist, {"TERM": "xterm-kitty", "ROPE_GRAPHICS": "auto"})
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 100, 1000, 800))
+    read_until(fd, b"[1]> ")
+    os.write(fd, b"plot(1:3)" + ENTER)
+    raw = b""
+    end = time.time() + 10
+    while b"[2]> " not in ESC.sub(b"", raw) and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r: raw += os.read(fd, 4096)
+    m = re.search(rb"\x1b_Ga=T,f=32,o=z,q=2,s=(\d+),v=(\d+),m=[01];", raw)
+    check("plot at a kitty terminal is shown before the prompt", m is not None and raw.index(b"\x1b_G") < raw.index(b"[2]> "))
+    check("the page size follows the window in pixels", m is not None and (int(m.group(1)), int(m.group(2))) == (800, 480))
+    os.write(fd, b"q()" + ENTER)
+    wait_exit(pid)
+    os.close(fd)
+
+    # 14. An unknown terminal is asked; one that reports sixel in its device
+    # attributes gets sixel output.
+    pending = b""
+    pid, fd = spawn(hist, {"TERM": "xterm-256color", "ROPE_GRAPHICS": "auto"})
+    raw = b""
+    end = time.time() + 5
+    while b"\x1b[c" not in raw and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r: raw += os.read(fd, 4096)
+    check("startup asks the terminal what it can do", b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\" in raw and b"\x1b[16t" in raw and b"\x1b[c" in raw)
+    os.write(fd, b"\x1b[6;20;10t\x1b[?64;1;4;22c")
+    read_until(fd, b"[1]> ")
+    os.write(fd, b"plot(1:3)" + ENTER)
+    raw = b""
+    end = time.time() + 10
+    while b"[2]> " not in ESC.sub(b"", raw) and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r: raw += os.read(fd, 4096)
+    check("a terminal answering sixel gets sixel", b'\x1bP0;1;0q"1;1;640;288' in raw)
+    os.write(fd, b"q()" + ENTER)
+    wait_exit(pid)
+    os.close(fd)
+
+    # 15. A terminal that answers with neither is left with R's default device.
+    pending = b""
+    pid, fd = spawn(hist, {"TERM": "xterm-256color", "ROPE_GRAPHICS": "auto"})
+    raw = b""
+    end = time.time() + 5
+    while b"\x1b[c" not in raw and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r: raw += os.read(fd, 4096)
+    os.write(fd, b"\x1b[?62;22c")
+    read_until(fd, b"[1]> ")
+    os.write(fd, b"identical(getOption('device'), rope.graphics)" + ENTER)
+    out = read_until(fd, b"[2]> ")
+    check("a terminal without images keeps R's device", b"[1] FALSE" in out)
     os.write(fd, b"q()" + ENTER)
     wait_exit(pid)
     os.close(fd)

@@ -18,6 +18,9 @@
  * objects without forcing promises; at a browser() prompt Rope shows the
  * source around the current line, %where the stack, %up and %down move
  * between frames, and %debug browses the frames of the last uncaught error.
+ * Milestone 7: graphics. A device of its own (src/graphics.c) rasterises
+ * each page and shows it in the terminal as a kitty or sixel image before
+ * the next prompt.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -274,6 +277,12 @@ static SEXP rope_dbg_up_r(SEXP set);
 static SEXP rope_dbg_quiet_r(void);
 static SEXP rope_dbg_exprs_r(void);
 
+/* The graphics device, in graphics.c. */
+void rope_gd_init(void);
+void rope_gd_flush(void);
+SEXP rope_gd_format(void);
+SEXP rope_gd_open(SEXP width, SEXP height, SEXP pointsize, SEXP dpi, SEXP bg);
+
 #define ROPE_FN(f) ((DL_FUNC)(void (*)(void))(f))
 
 static const R_CallMethodDef rope_call_methods[] = {
@@ -292,6 +301,8 @@ static const R_CallMethodDef rope_call_methods[] = {
     { "rope_dbg_up",       ROPE_FN(rope_dbg_up_r),     1 },
     { "rope_dbg_quiet",    ROPE_FN(rope_dbg_quiet_r),  0 },
     { "rope_dbg_exprs",    ROPE_FN(rope_dbg_exprs_r),  0 },
+    { "rope_gd_format",    ROPE_FN(rope_gd_format),    0 },
+    { "rope_gd_open",      ROPE_FN(rope_gd_open),      5 },
     { NULL, NULL, 0 }
 };
 
@@ -936,6 +947,16 @@ static const char rope_r_setup[] =
     "      inspect = inspect(target(k0, rho), arg))\n"
     "    invisible(.Last.value)\n"
     "  }\n"
+    "  env$rope.graphics <- function(width = getOption('rope.plot.width'),\n"
+    "                            height = getOption('rope.plot.height'),\n"
+    "                            pointsize = getOption('rope.plot.pointsize', 12),\n"
+    "                            dpi = getOption('rope.plot.dpi'),\n"
+    "                            bg = getOption('rope.plot.bg', 'white')) {\n"
+    "    .Call('rope_gd_open', as.numeric(width), as.numeric(height), as.numeric(pointsize),\n"
+    "          as.numeric(dpi), as.character(bg))\n"
+    "    invisible()\n"
+    "  }\n"
+    "  if (!is.null(.Call('rope_gd_format'))) options(device = env$rope.graphics)\n"
     "  attach(env, name = 'rope', warn.conflicts = FALSE)\n"
     "  addTaskCallback(function(expr, value, ok, visible)\n"
     "    .Call('rope_out_record', expr, value, visible), name = 'rope')\n"
@@ -2216,6 +2237,9 @@ static int rope_read_console(const char *prompt, unsigned char *buf, int len,
 {
     char *line = NULL;
 
+    /* Pages drawn on since the last prompt are shown before this one. */
+    rope_gd_flush();
+
     /*
      * Leftovers from the previous line: they were for R's evaluation of it,
      * which is over, whether or not it got as far as the task callback.
@@ -2358,6 +2382,7 @@ int main(int argc, char **argv)
 
     rope_history_init();
     rope_editor_init();
+    rope_gd_init();
 
     setup_Rmainloop();
     rope_out_init();
