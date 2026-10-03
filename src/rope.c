@@ -2349,6 +2349,50 @@ static void rope_cleanup(SA_TYPE saveact, int status, int run_last)
     else exit(status);
 }
 
+/* ---- welcome banner ------------------------------------------------------- */
+
+#define ROPE_VERSION "0.1.0"
+
+/*
+ * Shown once, before the first prompt, on an interactive terminal. -q,
+ * --quiet and --silent (R's own spellings) turn it off, as do -e and -f,
+ * which are not interactive sessions.
+ */
+static int rope_wants_banner(int argc, char **argv)
+{
+    if (!rope_editor_usable()) return 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-q") || !strcmp(a, "--quiet") || !strcmp(a, "--silent") ||
+            !strcmp(a, "-e") || !strcmp(a, "-f") || !strncmp(a, "--file=", 7))
+            return 0;
+        if (!strcmp(a, "--args")) break;
+    }
+    return 1;
+}
+
+static void rope_banner(void)
+{
+    int colour = rope_colour();
+    const char *bold = colour ? ROPE_SGR_BOLD : "";
+    const char *dim  = colour ? ROPE_SGR_DIM  : "";
+    const char *off  = colour ? ROPE_SGR_OFF  : "";
+
+    SEXP v = Rf_findVarInFrame(R_BaseEnv, Rf_install("R.version.string"));
+    const char *rver = (TYPEOF(v) == STRSXP && XLENGTH(v) == 1)
+                           ? CHAR(STRING_ELT(v, 0)) : "R";
+
+    SEXP fmt = PROTECT(rope_gd_format());
+    const char *plots = (TYPEOF(fmt) == STRSXP) ? CHAR(STRING_ELT(fmt, 0)) : NULL;
+
+    printf("%sRope %s%s %s\xc2\xb7 %s%s\n", bold, ROPE_VERSION, off, dim, rver, off);
+    if (plots) printf("%splots appear inline (%s)%s\n", dim, plots, off);
+    else       printf("%sno inline graphics in this terminal%s\n", dim, off);
+    printf("%s%%help lists the commands, F1 the editor keys, q() quits%s\n\n", dim, off);
+    fflush(stdout);
+    UNPROTECT(1);
+}
+
 /* ---- main ----------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -2386,6 +2430,7 @@ int main(int argc, char **argv)
 
     setup_Rmainloop();
     rope_out_init();
+    if (rope_wants_banner(argc, argv)) rope_banner();
     run_Rmainloop();
 
     /* Normally unreachable: q() exits through rope_cleanup. */
