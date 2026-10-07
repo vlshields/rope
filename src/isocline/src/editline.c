@@ -619,9 +619,47 @@ static void edit_cursor_match_brace(ic_env_t* env, editor_t* eb) {
   edit_refresh(env,eb);
 }
 
+// rope: a minimal R lexer for auto-pairing: is byte `pos` of `s` in code, in a
+// string (`*quote` opened it; `*escaped` after a backslash) or in a comment?
+typedef enum { ROPE_LEX_CODE, ROPE_LEX_STRING, ROPE_LEX_COMMENT } rope_lex_t;
+
+static rope_lex_t rope_lex_at(const char* s, ssize_t pos, char* quote, bool* escaped) {
+  char q = 0;
+  bool esc = false, comment = false;
+  for (ssize_t i = 0; i < pos && s[i] != 0; i++) {
+    const char c = s[i];
+    if (comment) { if (c == '\n') comment = false; }
+    else if (q != 0) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == q) q = 0;
+    }
+    else if (c == '#') comment = true;
+    else if (c == '"' || c == '\'' || c == '`') q = c;
+  }
+  *quote = q;
+  *escaped = esc;
+  return (comment ? ROPE_LEX_COMMENT : q != 0 ? ROPE_LEX_STRING : ROPE_LEX_CODE);
+}
+
+// rope: is the cursor inside an empty pair in code, `(|)` or `"|"`?
+static bool rope_in_empty_pair(editor_t* eb) {
+  if (eb->pos <= 0) return false;
+  const char* s = sbuf_string(eb->input);
+  const char* pairs = "()[]{}\"\"''``";
+  char quote; bool escaped;
+  for (const char* p = pairs; *p != 0; p += 2) {
+    if (s[eb->pos-1] == p[0] && s[eb->pos] == p[1]) {
+      return (rope_lex_at(s, eb->pos-1, &quote, &escaped) == ROPE_LEX_CODE);
+    }
+  }
+  return false;
+}
+
 static void edit_backspace(ic_env_t* env, editor_t* eb) {
   if (eb->pos <= 0) return;
   editor_start_modify(eb);
+  if (!env->no_autobrace && rope_in_empty_pair(eb)) sbuf_delete_char_at(eb->input, eb->pos);  // rope: both halves
   eb->pos = sbuf_delete_char_before(eb->input,eb->pos);
   edit_refresh(env,eb);
 }
@@ -770,30 +808,38 @@ static void edit_insert_unicode(ic_env_t* env, editor_t* eb, unicode_t u) {
   edit_refresh_hint(env, eb);
 }
 
+// rope: R-aware auto-pairing, replacing upstream's. A bracket or quote typed
+// in code gets its closer when the cursor is before blank space or a closer;
+// typing the closer steps over it. Nothing is paired inside a string or a
+// comment, and input that is already waiting (a paste, typed-ahead keys) is
+// taken literally, so pasted code is never doubled up.
 static void edit_auto_brace(ic_env_t* env, editor_t* eb, char c) {
   if (env->no_autobrace) return;
-  const char* braces = ic_env_get_auto_braces(env);
-  for (const char* b = braces; *b != 0; b += 2) {
-    if (*b == c) {
-      const char close = b[1];
-      //if (sbuf_char_at(eb->input, eb->pos) != close) {
-        sbuf_insert_char_at(eb->input, close, eb->pos);
-        bool balanced = false;
-        find_matching_brace(sbuf_string(eb->input), eb->pos, braces, &balanced );
-        if (!balanced) {
-          // don't insert if it leads to an unbalanced expression.
-          sbuf_delete_char_at(eb->input, eb->pos);
-        }
-      //}
-      return;
-    }
-    else if (b[1] == c) {
-      // close brace, check if there we don't overwrite to the right
-      if (sbuf_char_at(eb->input, eb->pos) == c) {
-        sbuf_delete_char_at(eb->input, eb->pos);
-      }
-      return;
-    }
+  if (strchr("()[]{}\"'`", c) == NULL) return;
+  if (tty_has_pending(env->tty)) return;
+  const char* s = sbuf_string(eb->input);
+  const ssize_t at = eb->pos - 1;            // where `c` went
+  const char prev = (at > 0 ? s[at-1] : 0);
+  const char next = sbuf_char_at(eb->input, eb->pos);
+  char quote = 0;
+  bool escaped = false;
+  const rope_lex_t lex = rope_lex_at(s, at, &quote, &escaped);
+  if (lex == ROPE_LEX_STRING) {
+    if (c == quote && !escaped && next == c) sbuf_delete_char_at(eb->input, eb->pos);
+    return;
+  }
+  if (lex == ROPE_LEX_COMMENT) return;
+  const bool room = (next == 0 || strchr(" \t\n)]},;", next) != NULL);
+  const char* open = strchr("([{", c);
+  if (open != NULL) {
+    if (room) sbuf_insert_char_at(eb->input, ")]}"[open - "([{"], eb->pos);
+  }
+  else if (strchr(")]}", c) != NULL) {
+    if (next == c) sbuf_delete_char_at(eb->input, eb->pos);
+  }
+  else if (room && prev != c && (prev == 0 || strchr(".\\_", prev) == NULL) &&
+           !((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9'))) {
+    sbuf_insert_char_at(eb->input, c, eb->pos);   // a quote, not right after a name
   }
 }
 
@@ -928,7 +974,9 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
     // Operations that may return
     if (c == KEY_ENTER) {
       if (!env->singleline_only && env->is_complete != NULL &&
-          !env->is_complete(sbuf_string(eb.input), env->is_complete_arg))
+          (!env->is_complete(sbuf_string(eb.input), env->is_complete_arg) ||
+           // rope: Enter in a paired `{|}` opens the block instead of sending it
+           (!env->no_autobrace && rope_in_empty_pair(&eb) && sbuf_char_at(eb.input, eb.pos) == '}')))
       {
         // rope: incomplete input, Enter inserts a newline
         edit_insert_char(env, &eb, '\n');

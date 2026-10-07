@@ -338,6 +338,16 @@ ic_private void tty_cpush_char(tty_t* tty, uint8_t c) {
   tty_cpush(tty, (const char*)buf);
 }
 
+// rope: is more input already waiting? (a paste, or typed-ahead keys)
+ic_private bool tty_has_pending(tty_t* tty) {
+  if (tty == NULL) return false;
+  if (tty->push_count > 0 || tty->cpush_count > 0) return true;
+  uint8_t c;
+  if (!tty_readc_noblock(tty, &c, 0)) return false;
+  tty_cpush_char(tty, c);
+  return true;
+}
+
 
 //-------------------------------------------------------------
 // Push escape codes (used on Windows to insert keys)

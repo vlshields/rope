@@ -323,5 +323,35 @@ with tempfile.TemporaryDirectory() as tmp:
     wait_exit(pid)
     os.close(fd)
 
+    # 16. Brackets and quotes typed key by key are closed; pastes (every write
+    #     above arrives in one piece) are taken literally.
+    def typed(s):
+        for b in s:
+            os.write(fd, bytes([b]))
+            time.sleep(0.03)
+    pending = b""
+    pid, fd = spawn(os.path.join(tmp, "hist-pairs"))
+    read_until(fd, b"[1]> ")
+    typed(b"c(1, 2" + ENTER)
+    out = read_until(fd, b"[2]> ")
+    check("an open paren is closed", b"[1] 1 2" in out)
+    typed(b"\"abc" + ENTER)
+    out = read_until(fd, b"[3]> ")
+    check("an open quote is closed", b'[1] "abc"' in out)
+    typed(b"nchar(\"((\")" + ENTER)
+    out = read_until(fd, b"[4]> ")
+    check("closers are typed over, nothing pairs in a string", b"[1] 2" in out)
+    typed(b"sum(\x7f(5)" + ENTER)
+    out = read_until(fd, b"[5]> ")
+    check("backspace in an empty pair deletes both", b"[1] 5" in out)
+    typed(b"f <- function() {" + ENTER + b"7" + ENTER)
+    read_until(fd, b"[6]> ")
+    typed(b"f()" + ENTER)
+    out = read_until(fd, b"[7]> ")
+    check("enter inside {} opens the block", b"[1] 7" in out)
+    os.write(fd, b"q()" + ENTER)
+    wait_exit(pid)
+    os.close(fd)
+
 print("pty:", "ok" if not fails else f"{len(fails)} failed")
 sys.exit(1 if fails else 0)

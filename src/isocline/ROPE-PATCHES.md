@@ -15,6 +15,12 @@ Every change to upstream is marked with a `rope:` comment. They are:
 - `src/editline.c`: the Enter handling for the hook; a bare newline byte
   (pasted or typed-ahead text, Ctrl-J) is treated as Enter when the hook is
   set; `^C` is printed when a line is cancelled.
+- `src/editline.c`: auto-pairing is rewritten for R (`edit_auto_brace` and a
+  small string/comment lexer, `rope_lex_at`): no pairing in strings, comments,
+  after a name, or while input is already waiting (pastes); Backspace in an
+  empty pair deletes both; Enter in `{}` inserts an indented line.
+- `src/tty.c`, `src/tty.h`: `tty_has_pending()` tells whether more input is
+  already waiting, for the paste check above.
 - `src/completions.c`: `ic_completion_input()` is declared upstream but was
   never defined.
 - `src/tty.c`: raw mode is entered and left with `TCSADRAIN` instead of

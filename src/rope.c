@@ -2204,7 +2204,7 @@ static void rope_editor_init(void)
 {
     ic_set_prompt_marker("", "");          /* prompts arrive whole from R */
     ic_enable_hint(false);                 /* a hint would run R's completer on every pause */
-    ic_enable_brace_insertion(false);      /* no auto-closing: type what you mean */
+    ic_enable_brace_insertion(getenv("ROPE_NO_AUTOPAIR") == NULL);  /* see editline.c */
     ic_set_default_completer(rope_completer, NULL);
     ic_set_default_highlighter(rope_highlight, NULL);
     ic_set_is_complete(rope_is_complete, NULL);
