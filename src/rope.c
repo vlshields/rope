@@ -2351,7 +2351,7 @@ static void rope_cleanup(SA_TYPE saveact, int status, int run_last)
 
 /* ---- welcome banner ------------------------------------------------------- */
 
-#define ROPE_VERSION "0.1.0"
+#define ROPE_VERSION "0.2.0"
 
 /*
  * Shown once, before the first prompt, on an interactive terminal. -q,
@@ -2384,6 +2384,17 @@ static void rope_banner(void)
 
     SEXP fmt = PROTECT(rope_gd_format());
     const char *plots = (TYPEOF(fmt) == STRSXP) ? CHAR(STRING_ELT(fmt, 0)) : NULL;
+
+    static const char *const art[] = {
+        "  ____",
+        " |  _ \\ ___  _ __   ___ ",
+        " | |_) / _ \\| '_ \\ / _ \\",
+        " |  _ < (_) | |_) |  __/",
+        " |_| \\_\\___/| .__/ \\___|",
+        "            |_|",
+    };
+    for (size_t i = 0; i < sizeof art / sizeof *art; i++)
+        printf("%s%s%s\n", bold, art[i], off);
 
     printf("%sRope %s%s %s\xc2\xb7 %s%s\n", bold, ROPE_VERSION, off, dim, rver, off);
     if (plots) printf("%splots appear inline (%s)%s\n", dim, plots, off);
