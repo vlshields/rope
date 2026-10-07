@@ -19,8 +19,7 @@ Rope needs R built with a shared `libR` (`R CMD config --ldflags` should list
 
 Arguments after `rope` are passed through to R. `make check` runs the tests.
 
-For the full list of keys, `%` commands and build options, see
-[REFERENCE.md](REFERENCE.md).
+
 
 ### Windows
 
