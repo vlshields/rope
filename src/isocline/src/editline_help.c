@@ -56,6 +56,7 @@ static const char* help[] = {
 
   "", "Editing:",
   "enter",      "accept current input",
+  "alt--",      "insert an assignment arrow ( <- )",  // rope
   #ifndef __APPLE__
   "^enter, ^j", "",
   "shift-tab",

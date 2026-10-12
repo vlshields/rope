@@ -866,6 +866,16 @@ static void edit_insert_char(ic_env_t* env, editor_t* eb, char c) {
   edit_refresh_hint(env,eb);  
 }
 
+// rope: alt-- inserts R's assignment arrow, as in RStudio. The leading
+// space is left out when the cursor already follows blank space.
+static void edit_insert_assign(ic_env_t* env, editor_t* eb) {
+  editor_start_modify(eb);
+  const char prev = (eb->pos > 0 ? sbuf_char_at(eb->input, eb->pos-1) : ' ');
+  const char* arrow = (strchr(" \t\n", prev) != NULL ? "<- " : " <- ");
+  eb->pos = sbuf_insert_at(eb->input, arrow, eb->pos);
+  edit_refresh_hint(env, eb);
+}
+
 //-------------------------------------------------------------
 // Help
 //-------------------------------------------------------------
@@ -1137,6 +1147,9 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
         break;
 
       // Editing
+      case WITH_ALT('-'):  // rope: assignment arrow
+        edit_insert_assign(env, &eb);
+        break;
       case KEY_SHIFT_TAB:
       case KEY_LINEFEED: // '\n' (ctrl+J, shift+enter)
         if (!env->singleline_only) { 

@@ -19,6 +19,8 @@ Every change to upstream is marked with a `rope:` comment. They are:
   small string/comment lexer, `rope_lex_at`): no pairing in strings, comments,
   after a name, or while input is already waiting (pastes); Backspace in an
   empty pair deletes both; Enter in `{}` inserts an indented line.
+- `src/editline.c`, `src/editline_help.c`: Alt-`-` inserts ` <- `
+  (`edit_insert_assign`), without the leading space after blank space.
 - `src/tty.c`, `src/tty.h`: `tty_has_pending()` tells whether more input is
   already waiting, for the paste check above.
 - `src/completions.c`: `ic_completion_input()` is declared upstream but was
