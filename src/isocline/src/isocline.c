@@ -338,6 +338,13 @@ ic_public void ic_set_is_complete(ic_is_complete_fun_t* is_complete, void* arg) 
 }
 
 // rope: see isocline.h
+ic_public void ic_set_help_handler(ic_help_fun_t* help, void* arg) {
+  ic_env_t* env = ic_get_env(); if (env==NULL) return;
+  env->help = help;
+  env->help_arg = arg;
+}
+
+// rope: see isocline.h
 ic_public bool ic_readline_cancelled(void) {
   ic_env_t* env = ic_get_env(); if (env==NULL) return false;
   return env->cancelled;

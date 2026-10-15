@@ -52,6 +52,8 @@ struct ic_env_s {
   ic_is_complete_fun_t* is_complete; // rope: is the input complete? (Enter inserts a newline if not)
   void*           is_complete_arg;  // rope: user state for `is_complete`
   bool            cancelled;        // rope: was the last edit cancelled with ctrl+C?
+  ic_help_fun_t*  help;             // rope: F1 help on the input at the cursor
+  void*           help_arg;         // rope: user state for `help`
 };
 
 ic_private char*        ic_editline(ic_env_t* env, const char* prompt_text);

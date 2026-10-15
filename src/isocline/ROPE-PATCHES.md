@@ -21,6 +21,11 @@ Every change to upstream is marked with a `rope:` comment. They are:
   empty pair deletes both; Enter in `{}` inserts an indented line.
 - `src/editline.c`, `src/editline_help.c`: Alt-`-` inserts ` <- `
   (`edit_insert_assign`), without the leading space after blank space.
+- `include/isocline.h`, `src/isocline.c`, `src/env.h`, `src/editline.c`,
+  `src/editline_help.c`: `ic_set_help_handler()` installs a hook for F1
+  (`edit_topic_help`), called out of raw mode with the input and cursor
+  offset; the input is redrawn after it. When it returns false F1 shows the
+  editor keys as upstream does.
 - `src/tty.c`, `src/tty.h`: `tty_has_pending()` tells whether more input is
   already waiting, for the paste check above.
 - `src/completions.c`: `ic_completion_input()` is declared upstream but was

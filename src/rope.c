@@ -523,6 +523,15 @@ static const char rope_r_setup[] =
     "      if (inherits(x, 'tbl_df')) print(x, n = Inf, width = Inf) else print(x))\n"
     "    invisible(.Call('rope_page_text', lines))\n"
     "  }\n"
+    "  env$.rope_help <- function(topic, package) {\n"
+    "    h <- do.call(utils::help, list(topic, package = package))  # help() quotes its arguments\n"
+    "    if (length(h) > 1L) {  # the first on the search path, not a menu\n"
+    "      a <- attributes(h)\n"
+    "      h <- h[1L]\n"
+    "      attributes(h) <- a\n"
+    "    }\n"
+    "    print(h)\n"
+    "  }\n"
     "  # -- inspector and debugger --\n"
     "  utf8 <- function() isTRUE(l10n_info()[['UTF-8']])\n"
     "  term_width <- function() { t <- .Call('rope_term'); if (is.null(t)) 80L else t[1L] }\n"
@@ -2020,6 +2029,99 @@ static bool rope_is_complete(const char *input, void *arg)
 }
 
 /*
+ * F1: R's help on the name at the cursor, as in RStudio. The name is the one
+ * the cursor is in or just after; right after `name(` it is that name, so a
+ * call just opened (with its closing paren paired in) still finds it. pkg::name
+ * and pkg:::name look in that package. Nothing is shown for anything else
+ * (numbers, strings, operators); the editor then lists its keys instead.
+ *
+ * .rope_help shows it through R's own pager, as ?name does, taking the first
+ * match on the search path where help() would ask with a menu.
+ */
+static bool rope_name_byte(char c)
+{
+    return isalnum((unsigned char)c) || c == '.' || c == '_' || (unsigned char)c >= 0x80;
+}
+
+/* The name ending at `end`, as [*start, end); false when there is none. */
+static bool rope_name_before(const char *s, long end, long *start)
+{
+    long i = end;
+    while (i > 0 && rope_name_byte(s[i - 1])) i--;
+    if (i == end || isdigit((unsigned char)s[i])) return false;
+    if (s[i] == '.' && isdigit((unsigned char)s[i + 1])) return false;   /* .5 */
+    *start = i;
+    return true;
+}
+
+/* The length of a `::` or `:::` at s[i], else 0. */
+static long rope_colons(const char *s, long i)
+{
+    if (s[i] != ':' || s[i + 1] != ':') return 0;
+    return s[i + 2] == ':' ? 3 : 2;
+}
+
+struct rope_help { SEXP topic, package; };
+
+static void rope_help_cb(void *data)
+{
+    struct rope_help *h = data;
+    SEXP fn = rope_env ? Rf_findVarInFrame(rope_env, Rf_install(".rope_help")) : R_UnboundValue;
+    if (TYPEOF(fn) != CLOSXP) return;
+    SEXP call = PROTECT(Rf_lang3(fn, h->topic, h->package));
+    Rf_eval(call, R_GlobalEnv);
+    UNPROTECT(1);
+}
+
+static bool rope_help_at(const char *input, long pos, void *arg)
+{
+    (void)arg;
+    if (rope_busy) return false;
+    long len = (long)strlen(input);
+    if (pos > len) pos = len;
+
+    long end = pos;
+    while (end < len && rope_name_byte(input[end])) end++;
+    long start;
+    if (!rope_name_before(input, end, &start)) {
+        if (pos == 0 || input[pos - 1] != '(') return false;
+        end = pos - 1;
+        while (end > 0 && input[end - 1] == ' ') end--;
+        if (!rope_name_before(input, end, &start)) return false;
+    }
+
+    /* pkg::name, with the cursor on either side of the colons */
+    long pkg_start = -1, pkg_end = -1;
+    long k = rope_colons(input, end);
+    if (k && rope_name_byte(input[end + k])) {
+        pkg_start = start;
+        pkg_end = end;
+        start = end + k;
+        end = start;
+        while (end < len && rope_name_byte(input[end])) end++;
+    } else if (start >= 2 && input[start - 1] == ':' && input[start - 2] == ':') {
+        long colons = (start >= 3 && input[start - 3] == ':') ? 3 : 2;
+        long s;
+        if (rope_name_before(input, start - colons, &s)) {
+            pkg_start = s;
+            pkg_end = start - colons;
+        }
+    }
+
+    struct rope_help h;
+    h.topic = PROTECT(Rf_ScalarString(Rf_mkCharLenCE(input + start, (int)(end - start), CE_UTF8)));
+    h.package = PROTECT(pkg_start < 0 ? R_NilValue :
+        Rf_ScalarString(Rf_mkCharLenCE(input + pkg_start, (int)(pkg_end - pkg_start), CE_UTF8)));
+    fflush(stdout);
+    R_ToplevelExec(rope_help_cb, &h);
+    R_interrupts_pending = 0;   /* a Ctrl-C in the pager was the pager's */
+    UNPROTECT(2);
+    fflush(stdout);
+    fflush(stderr);
+    return true;
+}
+
+/*
  * Completion is R's own. .rope_complete in the rope environment drives
  * utils:::.completeToken and returns the token being completed and the
  * candidates; each candidate replaces the token. R counts characters where
@@ -2208,6 +2310,7 @@ static void rope_editor_init(void)
     ic_set_default_completer(rope_completer, NULL);
     ic_set_default_highlighter(rope_highlight, NULL);
     ic_set_is_complete(rope_is_complete, NULL);
+    ic_set_help_handler(rope_help_at, NULL);
     ic_style_def("rope-keyword",  "ansi-magenta");
     ic_style_def("rope-constant", "ansi-cyan");
     ic_style_def("rope-string",   "ansi-green");

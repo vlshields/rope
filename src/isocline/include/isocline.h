@@ -289,6 +289,12 @@ void ic_set_is_complete(ic_is_complete_fun_t* is_complete, void* arg);
 // which returns an empty string like an empty line does.
 bool ic_readline_cancelled(void);
 
+// rope: F1 calls this hook with the input and the cursor's byte offset in it,
+// with the terminal out of raw mode, and redraws the input afterwards. When it
+// returns false (nothing to look up) F1 shows the editor keys as upstream does.
+typedef bool (ic_help_fun_t)(const char* input, long pos, void* arg);
+void ic_set_help_handler(ic_help_fun_t* help, void* arg);
+
 /// Set the style of characters starting at position `pos`.
 void ic_highlight(ic_highlight_env_t* henv, long pos, long count, const char* style );
 

@@ -882,6 +882,27 @@ static void edit_insert_assign(ic_env_t* env, editor_t* eb) {
 
 #include "editline_help.c"
 
+// rope: F1 hands the input to the help hook, out of raw mode so that what it
+// prints (or the pager it runs) sees a normal terminal, then redraws the input
+// below. Without a hook, or when it finds nothing, the editor keys are shown.
+static void edit_topic_help(ic_env_t* env, editor_t* eb) {
+  edit_clear(env, eb);
+  term_up(env->term, eb->cur_row);
+  eb->cur_rows = 0;
+  eb->cur_row = 0;
+  bool shown = false;
+  if (env->help != NULL) {
+    term_flush(env->term);
+    term_end_raw(env->term, false);
+    tty_end_raw(env->tty);
+    shown = env->help(sbuf_string(eb->input), (long)eb->pos, env->help_arg);
+    tty_start_raw(env->tty);
+    term_start_raw(env->term);
+  }
+  if (shown) edit_refresh(env, eb);
+  else edit_show_help(env, eb);
+}
+
 //-------------------------------------------------------------
 // History
 //-------------------------------------------------------------
@@ -1057,7 +1078,7 @@ static char* edit_line( ic_env_t* env, const char* prompt_text )
         edit_redo_restore(env, &eb);
         break;
       case KEY_F1:
-        edit_show_help(env, &eb);
+        edit_topic_help(env, &eb);  // rope: help on the word at the cursor
         break;
 
       // navigation
